@@ -11,7 +11,7 @@ export type NextRouteHandler = (
  * @example
  * ```ts
  * // app/api/premium/route.ts
- * import { withPayment } from 'yeetful/next'
+ * import { withPayment } from 'pantessa/next'
  *
  * export const GET = withPayment(
  *   { price: '0.01', recipient: '0xYourAddress', network: 'base' },

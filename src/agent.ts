@@ -1,5 +1,5 @@
 /**
- * yeetful/agent — the "agent expense account."
+ * pantessa/agent — the "agent expense account."
  *
  * Wrap your agent's HTTP calls in a single grant-aware `pay()`. Before any x402
  * payment is signed it enforces a spend grant — an allowlist of hosts plus
@@ -14,18 +14,18 @@
  *
  * @example
  * ```ts
- * import { yeetful } from 'yeetful/agent'
+ * import { pantessa } from 'pantessa/agent'
  *
- * const pay = yeetful({
+ * const pay = pantessa({
  *   wallet,                                   // viem WalletClient
  *   grant: {
- *     id: 'cmbq…',                            // hosted grant id (yeetful.com)
+ *     id: 'cmbq…',                            // hosted grant id (pantessa.com)
  *     allow: ['tripadvisor.x402.paysponge.com', 'anthropic.yeetful.com'],
  *     perCallUsd: 0.05,
  *     perDayUsd: 2,
  *     expiresAt: '2026-12-31',
  *   },
- *   apiKey: process.env.YEETFUL_API_KEY,      // yf_… → receipts sync to your dashboard
+ *   apiKey: process.env.PANTESSA_API_KEY,     // yf_… → receipts sync to your dashboard
  *   onReceipt: (r) => console.log(r.host, r.amountUsd, r.txHash),
  * })
  *
@@ -55,7 +55,7 @@ export type GrantViolation =
   | 'AGENT_PAUSED'
   | 'ACCOUNT_FROZEN'
 
-/** The remote kill switch (yeetful.com): a reversible freeze that halts ALL
+/** The remote kill switch (pantessa.com): a reversible freeze that halts ALL
  * payments. AGENT_PAUSED = this key; ACCOUNT_FROZEN = the whole expense
  * account. Surfaced on the policy + every receipt-sync echo. */
 export type HaltReason = 'AGENT_PAUSED' | 'ACCOUNT_FROZEN'
@@ -88,13 +88,13 @@ export interface GrantPolicy {
 
 /**
  * The hosted per-key budget for this agent (an agent IS an API key on
- * yeetful.com). Fetched from `GET {ledgerUrl}/api/agent/policy` with Bearer
+ * pantessa.com). Fetched from `GET {ledgerUrl}/api/agent/policy` with Bearer
  * auth and echoed back on every receipt-sync response. Budgets are advisory
  * at the rails — the agent pays from its own wallet — so this SDK is the
  * enforcement point: it refuses to pay once the key is over budget.
  */
 export interface AgentBudget {
-  /** Id of the API key (the agent identity) on yeetful.com. */
+  /** Id of the API key (the agent identity) on pantessa.com. */
   keyId: string
   /** Human label the key was minted with. */
   label?: string | null
@@ -114,7 +114,7 @@ export interface AgentBudget {
  * model as the per-key budget: the SDK is the enforcement point.
  */
 export interface OrgBudget {
-  /** Id of the organization on yeetful.com. */
+  /** Id of the organization on pantessa.com. */
   id: string
   /** Org name, when the policy includes it. */
   name?: string | null
@@ -157,7 +157,7 @@ export interface AgentOptions {
   /** Human-readable progress logging. */
   onEvent?: (message: string) => void
   /**
-   * Yeetful API key (`yf_…`, minted at yeetful.com while signed in). Together
+   * Pantessa API key (`yf_…`, minted at pantessa.com while signed in). Together
    * with `grant.id` it turns on hosted-ledger sync: every receipt is POSTed to
    * `{ledgerUrl}/api/grants/{grant.id}/ledger` with Bearer auth, so the
    * dashboard's budgets/audit trail include this agent's calls. Sync is
@@ -172,8 +172,8 @@ export interface AgentOptions {
    */
   apiKey?: string
   /**
-   * Base URL of the hosted ledger. Defaults to https://yeetful.com. Must be
-   * the CANONICAL origin (e.g. https://www.yeetful.com) — fetch silently
+   * Base URL of the hosted ledger. Defaults to {@link DEFAULT_LEDGER_URL}.
+   * Must be the CANONICAL origin (www, current domain) — fetch silently
    * drops the Authorization header when it follows a cross-origin redirect.
    */
   ledgerUrl?: string
@@ -188,13 +188,13 @@ export interface PayFn {
   /** USD spent over the life of this client instance. */
   spentTotalUsd(): number
   /**
-   * Last-known per-key budget from yeetful.com — null without `apiKey` or
+   * Last-known per-key budget from pantessa.com — null without `apiKey` or
    * until the policy loads. Kept fresh by receipt-sync responses and
    * `flushLedger()`.
    */
   agentBudget(): AgentBudget | null
   /**
-   * Last-known ORG budget from yeetful.com (0.5) — null for personal keys, or
+   * Last-known ORG budget from pantessa.com (0.5) — null for personal keys, or
    * without `apiKey` / until the policy loads. Kept fresh the same way as
    * `agentBudget()`.
    */
@@ -202,7 +202,7 @@ export interface PayFn {
   /**
    * Last-known remote halt state (0.5): the kill switch. `{ halted: false }`
    * until the policy loads; flips when the key/account is paused on
-   * yeetful.com (refreshed on every sync echo + `flushLedger()`).
+   * pantessa.com (refreshed on every sync echo + `flushLedger()`).
    */
   status(): HaltStatus
   /**
@@ -248,10 +248,18 @@ function txHashOf(res: Response): string | undefined {
 }
 
 /**
+ * Hosted ledger + policy origin. MUST be the canonical origin: `fetch` drops
+ * the Authorization header when it follows a cross-origin redirect, so an
+ * apex or pre-rebrand host here silently disables budget enforcement and
+ * ledger sync rather than erroring.
+ */
+export const DEFAULT_LEDGER_URL = 'https://www.pantessa.com'
+
+/**
  * Create a grant-aware paid `fetch`. Enforces the grant locally before signing
  * any x402 payment, pays with the wallet, and emits a receipt per call.
  */
-export function yeetful(options: AgentOptions): PayFn {
+export function pantessa(options: AgentOptions): PayFn {
   const { wallet, grant, onReceipt, onEvent } = options
   const log = onEvent ?? (() => {})
 
@@ -260,11 +268,11 @@ export function yeetful(options: AgentOptions): PayFn {
   let dayIndex = utcDayIndex(Date.now())
 
   // ── Hosted-ledger sync (optional): receipts → POST /api/grants/:id/ledger ──
-  const ledgerBase = (options.ledgerUrl ?? 'https://yeetful.com').replace(/\/+$/, '')
+  const ledgerBase = (options.ledgerUrl ?? DEFAULT_LEDGER_URL).replace(/\/+$/, '')
   const ledgerEndpoint =
     options.apiKey && grant.id ? `${ledgerBase}/api/grants/${grant.id}/ledger` : null
   if (options.apiKey && !grant.id) {
-    log('hosted-ledger sync disabled: grant.id is not set (use the id of your yeetful.com grant)')
+    log('hosted-ledger sync disabled: grant.id is not set (use the id of your pantessa.com grant)')
   }
   const ledgerFetch = options.fetch ?? globalThis.fetch
   // fetch silently DROPS the Authorization header when it follows a
@@ -434,8 +442,8 @@ export function yeetful(options: AgentOptions): PayFn {
         host,
         code,
         code === 'ACCOUNT_FROZEN'
-          ? 'the expense account is frozen on yeetful.com — resume it to pay'
-          : `this agent key${agent?.label ? ` "${agent.label}"` : ''} is paused on yeetful.com — resume it to pay`,
+          ? 'the expense account is frozen on pantessa.com — resume it to pay'
+          : `this agent key${agent?.label ? ` "${agent.label}"` : ''} is paused on pantessa.com — resume it to pay`,
       )
     }
     if (agent?.overBudget) {
@@ -530,3 +538,6 @@ export function yeetful(options: AgentOptions): PayFn {
   }
   return pay
 }
+
+/** @deprecated Renamed to {@link pantessa}. */
+export const yeetful = pantessa

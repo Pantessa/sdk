@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mountYeetfulChat, type YeetfulChatHandle } from './embed.js'
+import { mountPantessaChat, type PantessaChatHandle } from './embed.js'
 
-const ORIGIN = 'https://www.yeetful.com'
+const ORIGIN = 'https://www.pantessa.com'
+/** The pre-rebrand origin an existing install still points its iframe at. */
+const LEGACY_ORIGIN = 'https://www.yeetful.com'
 
 function makeContainer(): HTMLElement {
   const el = document.createElement('div')
@@ -43,9 +45,9 @@ function makeProvider() {
   }
 }
 
-const handles: YeetfulChatHandle[] = []
-function mount(opts: Parameters<typeof mountYeetfulChat>[0]) {
-  const h = mountYeetfulChat(opts)
+const handles: PantessaChatHandle[] = []
+function mount(opts: Parameters<typeof mountPantessaChat>[0]) {
+  const h = mountPantessaChat(opts)
   handles.push(h)
   return h
 }
@@ -56,10 +58,65 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-describe('mountYeetfulChat', () => {
+// The domain move (www.yeetful.com 307s to www.pantessa.com) means an iframe
+// pointed at the old origin RUNS on the new one. A parent pinned to a single
+// constant would drop every child message silently — no ready, no resize, no
+// wallet relay — so the accepted-origin set is load-bearing, not cosmetic.
+describe('mountPantessaChat — origin handling across the domain move', () => {
+  it('accepts a child speaking from the post-redirect origin and replies there', async () => {
+    // A pre-rebrand install: the caller still pins the old origin explicitly.
+    const h = mount({ container: makeContainer(), origin: LEGACY_ORIGIN })
+    expect(new URL(h.iframe.src).origin).toBe(LEGACY_ORIGIN)
+
+    const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+    // …but the redirect means the frame actually lives on the new origin.
+    dispatch(ORIGIN, readyMsg)
+    await flush()
+
+    h.setTheme('light')
+    expect(postMessage).toHaveBeenCalledWith(
+      { source: 'yeetful-embed', v: 1, type: 'theme', theme: 'light' },
+      ORIGIN,
+    )
+  })
+
+  it('fires onReady for a post-redirect child', async () => {
+    const onReady = vi.fn()
+    mount({ container: makeContainer(), origin: LEGACY_ORIGIN, onReady })
+    dispatch(ORIGIN, readyMsg)
+    await flush()
+    expect(onReady).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores a foreign origin even when the payload shape is right', async () => {
+    const onReady = vi.fn()
+    const onEvent = vi.fn()
+    mount({ container: makeContainer(), onReady, onEvent })
+    dispatch('https://evil.example', readyMsg)
+    dispatch('https://evil.example', { source: 'yeetful-embed', v: 1, type: 'event', name: 'turn' })
+    await flush()
+    expect(onReady).not.toHaveBeenCalled()
+    expect(onEvent).not.toHaveBeenCalled()
+  })
+
+  it('a self-hosted origin accepts only itself — no first-party set', async () => {
+    const onReady = vi.fn()
+    mount({ container: makeContainer(), origin: 'https://chat.acme.dev', onReady })
+    // Our origins carry no privilege over someone else's deployment.
+    dispatch(ORIGIN, readyMsg)
+    await flush()
+    expect(onReady).not.toHaveBeenCalled()
+
+    dispatch('https://chat.acme.dev', readyMsg)
+    await flush()
+    expect(onReady).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('mountPantessaChat', () => {
   it('throws a clear error outside the browser (SSR guard)', () => {
     vi.stubGlobal('window', undefined)
-    expect(() => mountYeetfulChat({})).toThrow('mountYeetfulChat is browser-only')
+    expect(() => mountPantessaChat({})).toThrow('mountPantessaChat is browser-only')
   })
 
   it('builds the /embed URL with mcps, address, theme and host params', () => {
@@ -100,8 +157,8 @@ describe('mountYeetfulChat', () => {
   it('respects a custom origin and requires a container inline', () => {
     const h = mount({ container: makeContainer(), origin: 'http://localhost:3000' })
     expect(new URL(h.iframe.src).origin).toBe('http://localhost:3000')
-    expect(() => mountYeetfulChat({})).toThrow(/container/)
-    expect(() => mountYeetfulChat({ container: '#nope' })).toThrow(/container/)
+    expect(() => mountPantessaChat({})).toThrow(/container/)
+    expect(() => mountPantessaChat({ container: '#nope' })).toThrow(/container/)
   })
 
   it('ignores messages from the wrong origin or wrong source', () => {
@@ -191,7 +248,7 @@ describe('mountYeetfulChat', () => {
 
   it('bubble mode mounts a launcher + hidden panel, toggles open/close, Escape closes', () => {
     const h = mount({ mode: 'bubble' })
-    const launcher = document.querySelector<HTMLButtonElement>('button[aria-label="Open Yeetful chat"]')
+    const launcher = document.querySelector<HTMLButtonElement>('button[aria-label="Open Pantessa chat"]')
     expect(launcher).toBeTruthy()
     const panel = h.iframe.parentElement as HTMLElement
     expect(panel.style.visibility).toBe('hidden')
@@ -326,7 +383,7 @@ describe('mountYeetfulChat', () => {
           v: 1,
           type: 'rpc:error',
           id: 'r3',
-          error: { code: 4200, message: 'eth_sign is not allowed by yeetful/embed' },
+          error: { code: 4200, message: 'eth_sign is not allowed by pantessa/embed' },
         },
         ORIGIN
       )
@@ -440,7 +497,7 @@ describe('mountYeetfulChat', () => {
 
     const hb = mount({ mode: 'bubble' })
     hb.destroy()
-    expect(document.querySelector('button[aria-label="Open Yeetful chat"]')).toBeNull()
+    expect(document.querySelector('button[aria-label="Open Pantessa chat"]')).toBeNull()
     expect(document.body.contains(hb.iframe)).toBe(false)
     hb.open()
     expect((hb.iframe.parentElement as HTMLElement).style.visibility).toBe('hidden')

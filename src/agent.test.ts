@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
 import type { WalletClient } from 'viem'
-import { yeetful, GrantError, type GrantPolicy, type Receipt } from './agent.js'
+// Imports BOTH names on purpose: the call sites still written as `yeetful(`
+// exercise the deprecated back-compat alias, so a broken alias fails CI.
+import { pantessa, yeetful, GrantError, type GrantPolicy, type Receipt } from './agent.js'
 
 // A wallet stub: createPaymentClient only needs `account` + `signTypedData`.
 const wallet = {
@@ -60,11 +62,11 @@ function grant(over: Partial<GrantPolicy> = {}): GrantPolicy {
   return { allow: [HOST], perCallUsd: 0.05, perDayUsd: 2, ...over }
 }
 
-describe('yeetful/agent', () => {
+describe('pantessa/agent', () => {
   it('pays an allowed call within budget and tracks spend + receipt', async () => {
     const f = mockFetch('10000') // $0.01
     const receipts: Receipt[] = []
-    const pay = yeetful({ wallet, grant: grant(), fetch: f.fn, onReceipt: (r) => { receipts.push(r) } })
+    const pay = pantessa({ wallet, grant: grant(), fetch: f.fn, onReceipt: (r) => { receipts.push(r) } })
 
     const res = await pay(URL_OK)
     expect(res.status).toBe(200)
@@ -77,7 +79,7 @@ describe('yeetful/agent', () => {
 
   it('blocks a host not on the allowlist without any network call', async () => {
     const f = mockFetch()
-    const pay = yeetful({ wallet, grant: grant(), fetch: f.fn })
+    const pay = pantessa({ wallet, grant: grant(), fetch: f.fn })
     await expect(pay('https://evil.com/x')).rejects.toMatchObject({
       name: 'GrantError',
       code: 'NOT_ALLOWED',
@@ -87,14 +89,14 @@ describe('yeetful/agent', () => {
 
   it('blocks a call above the per-call cap', async () => {
     const f = mockFetch('10000') // $0.01
-    const pay = yeetful({ wallet, grant: grant({ perCallUsd: 0.005 }), fetch: f.fn })
+    const pay = pantessa({ wallet, grant: grant({ perCallUsd: 0.005 }), fetch: f.fn })
     await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'OVER_PER_CALL' })
     expect(pay.spentTodayUsd()).toBe(0)
   })
 
   it('blocks once the daily budget is exhausted', async () => {
     const f = mockFetch('10000') // $0.01
-    const pay = yeetful({ wallet, grant: grant({ perDayUsd: 0.015 }), fetch: f.fn })
+    const pay = pantessa({ wallet, grant: grant({ perDayUsd: 0.015 }), fetch: f.fn })
     await pay(URL_OK) // 0.01 ok
     await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'BUDGET_EXCEEDED' }) // 0.02 > 0.015
     expect(pay.spentTodayUsd()).toBeCloseTo(0.01)
@@ -102,7 +104,7 @@ describe('yeetful/agent', () => {
 
   it('blocks an expired grant', async () => {
     const f = mockFetch()
-    const pay = yeetful({ wallet, grant: grant({ expiresAt: Date.now() - 1000 }), fetch: f.fn })
+    const pay = pantessa({ wallet, grant: grant({ expiresAt: Date.now() - 1000 }), fetch: f.fn })
     await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'EXPIRED' })
   })
 
@@ -142,7 +144,7 @@ describe('hosted-ledger sync', () => {
   it('POSTs settled receipts to the grant ledger with Bearer auth', async () => {
     const f = mockFetch('10000') // $0.01
     const l = withLedger(f.fn)
-    const pay = yeetful({
+    const pay = pantessa({
       wallet,
       grant: grant({ id: 'grant123' }),
       fetch: l.fn,
@@ -167,7 +169,7 @@ describe('hosted-ledger sync', () => {
   it('syncs denials too (the audit trail includes refusals)', async () => {
     const f = mockFetch()
     const l = withLedger(f.fn)
-    const pay = yeetful({
+    const pay = pantessa({
       wallet,
       grant: grant({ id: 'grant123' }),
       fetch: l.fn,
@@ -217,7 +219,7 @@ describe('hosted-ledger sync', () => {
       }
       return f.fn(input, init)
     }) as typeof fetch
-    const pay = yeetful({
+    const pay = pantessa({
       wallet,
       grant: grant({ id: 'grant123' }),
       fetch: flaky,
@@ -299,7 +301,7 @@ describe('x402 v2 challenges (CAIP-2 networks, `amount`, PAYMENT-SIGNATURE)', ()
   it('pays a v2 challenge: picks the EVM entry, sends the PAYMENT-SIGNATURE envelope', async () => {
     const f = mockFetchV2('10000') // $0.01
     const receipts: Receipt[] = []
-    const pay = yeetful({ wallet, grant: grant(), fetch: f.fn, onReceipt: (r) => { receipts.push(r) } })
+    const pay = pantessa({ wallet, grant: grant(), fetch: f.fn, onReceipt: (r) => { receipts.push(r) } })
 
     const res = await pay(URL_OK)
     expect(res.status).toBe(200)
@@ -317,7 +319,7 @@ describe('x402 v2 challenges (CAIP-2 networks, `amount`, PAYMENT-SIGNATURE)', ()
 
   it('enforces grant caps against the v2 `amount` field', async () => {
     const f = mockFetchV2('100000') // $0.10 > $0.05 per-call cap
-    const pay = yeetful({ wallet, grant: grant(), fetch: f.fn })
+    const pay = pantessa({ wallet, grant: grant(), fetch: f.fn })
     await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'OVER_PER_CALL' })
     expect(pay.spentTodayUsd()).toBe(0)
   })
@@ -335,7 +337,7 @@ describe('x402 v2 challenges (CAIP-2 networks, `amount`, PAYMENT-SIGNATURE)', ()
         { status: 402, headers: { 'content-type': 'application/json' } },
       )) as typeof fetch
     const receipts: Receipt[] = []
-    const pay = yeetful({ wallet, grant: grant(), fetch: fn, onReceipt: (r) => { receipts.push(r) } })
+    const pay = pantessa({ wallet, grant: grant(), fetch: fn, onReceipt: (r) => { receipts.push(r) } })
 
     await expect(pay(URL_OK)).rejects.toMatchObject({ name: 'PaymentError' })
     expect(receipts[0]).toMatchObject({ ok: false, note: 'payment-failed' })
@@ -538,7 +540,7 @@ describe('ledger sync redirect diagnosis', () => {
       return f.fn(input, init)
     }) as typeof fetch
 
-    const pay = yeetful({
+    const pay = pantessa({
       wallet,
       grant: grant({ id: 'g1' }),
       fetch: fn,
