@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.0.0 — renamed to `pantessa`
+
+**BREAKING (package name only).** Yeetful is now Pantessa, and the package
+follows: install `pantessa`, import from `pantessa/*`. The pre-rebrand
+`yeetful` package continues at `0.11.0` as a thin re-export of this one, marked
+deprecated on npm. Every renamed export keeps its old name as a deprecated
+alias, so a migration is a package swap plus an import-specifier change — no
+call-site changes required.
+
+- `yeetful()` → `pantessa()` (alias: `yeetful`)
+- `mountYeetfulChat()` → `mountPantessaChat()` (alias: `mountYeetfulChat`)
+- `YeetfulChatOptions` / `YeetfulChatHandle` → `PantessaChatOptions` /
+  `PantessaChatHandle` (aliases kept)
+
+**Hosted defaults moved to the current domain.** `www.yeetful.com` now 307s to
+`www.pantessa.com`, and a redirect is not a transparent no-op for either of the
+places this SDK talks to the hosted app:
+
+- `AgentOptions.ledgerUrl` now defaults to the new `DEFAULT_LEDGER_URL`
+  (`https://www.pantessa.com`). The old default was the **apex**
+  `https://yeetful.com`, which redirected even before the rename — and `fetch`
+  drops the `Authorization` header across a cross-origin redirect, so hosted
+  ledger sync and remote budget enforcement failed silently rather than
+  erroring. Anyone relying on the default was already unprotected.
+- `DEFAULT_RECEIPTS_URL` (earn-side `reportUsage`) moves to the new origin for
+  the same reason.
+
+**The embed origin check now survives a redirect.** An iframe pointed at
+`https://www.yeetful.com/embed` lands on `https://www.pantessa.com` — so a
+parent comparing `event.origin` against one pinned constant dropped *every*
+child message: no `ready`, no `resize`, and no host-wallet relay, with nothing
+in the console to explain it. `mountPantessaChat` now validates against a
+closed first-party allowlist (`FIRST_PARTY_EMBED_ORIGINS`) and pins replies to
+whichever accepted origin actually answers. Passing a first-party `origin`
+(including the pre-rebrand one) opts into the set; passing a self-hosted origin
+still accepts that origin and nothing else.
+
+**Deliberately unchanged.** The `yeetful-embed` postMessage `source`, the `yf_`
+/ `yfe_` key prefixes, the embed query-param names, and the `*.yeetful.com` MCP
+and facilitator hosts are wire and infrastructure identifiers, not brand
+strings. Renaming them would break every install and every stored allowlist
+that hasn't upgraded, so the rebrand leaves them alone.
+
 ## 0.10.1
 
 - **Fix: 402 bodies of `{}` no longer kill the payment flow.** Some x402 v2

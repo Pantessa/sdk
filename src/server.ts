@@ -149,14 +149,15 @@ function paymentRequiredResponse(
 
 export { Facilitator, DEFAULT_FACILITATOR_URL } from './facilitator.js'
 
-/** Canonical Yeetful earn-side ingestion endpoint (canonical origin — auth
- *  headers must survive, so no apex→www redirect). */
-export const DEFAULT_RECEIPTS_URL = 'https://www.yeetful.com/api/mcp/receipts'
+/** Canonical Pantessa earn-side ingestion endpoint. Canonical origin only —
+ *  `fetch` drops auth headers across a redirect, so an apex or pre-rebrand
+ *  host here fails silently instead of erroring. */
+export const DEFAULT_RECEIPTS_URL = 'https://www.pantessa.com/api/mcp/receipts'
 
 export interface ReportUsageOptions {
-  /** Your Yeetful API key (`yf_…`) — attributes the receipt to your account. */
+  /** Your Pantessa API key (`yf_…`) — attributes the receipt to your account. */
   apiKey: string
-  /** Your server's slug on yeetful.com (the one you claimed). */
+  /** Your server's slug on pantessa.com (the one you claimed). */
   mcp: string
   /** Price of the call in USD. */
   amountUsd: number | string
@@ -175,7 +176,7 @@ export interface ReportUsageOptions {
 }
 
 /**
- * Report one paid call your MCP served to your Yeetful dashboard — the earn-side
+ * Report one paid call your MCP served to your Pantessa dashboard — the earn-side
  * mirror of the agent's ledger sync.
  *
  * Fire-and-forget by design: it **never throws** and resolves to `false` on any

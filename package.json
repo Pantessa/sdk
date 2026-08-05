@@ -1,7 +1,7 @@
 {
-  "name": "yeetful",
-  "version": "0.10.1",
-  "description": "Spend-controlled x402 for AI agents. Give an agent an expense account \u2014 an allowlist + per-call/per-day budget \u2014 and pay any x402 endpoint in a few lines. Plus drop-in x402 client/server helpers.",
+  "name": "pantessa",
+  "version": "1.0.0",
+  "description": "Spend-controlled x402 for AI agents. Give an agent an expense account — an allowlist + per-call/per-day budget — and pay any x402 endpoint in a few lines. Plus drop-in x402 client/server helpers and the embeddable Pantessa chat.",
   "keywords": [
     "x402",
     "ai-agents",
@@ -16,15 +16,15 @@
     "next",
     "express",
     "viem",
-    "yeetful"
+    "pantessa"
   ],
-  "homepage": "https://yeetful.com",
+  "homepage": "https://www.pantessa.com",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Yeetful/sdk.git"
   },
   "license": "MIT",
-  "author": "Yeetful",
+  "author": "Pantessa",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",

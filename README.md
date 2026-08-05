@@ -1,9 +1,15 @@
-# yeetful
+# pantessa
 
-**Spend-controlled [x402](https://www.x402.org) for AI agents.** Give an agent an *expense account* — an allowlist of endpoints plus per-call / per-day budgets — and let it pay any x402 service with no API keys. Enforcement is local and instant; every call emits a receipt. Built for [Yeetful](https://yeetful.com), MIT-licensed, works anywhere TypeScript does.
+> **Renamed from `yeetful`.** Yeetful is now Pantessa. `npm i pantessa && npm rm yeetful`,
+> swap the import specifier, and you're done — every renamed export keeps its old
+> name as a deprecated alias. The `yeetful` package lives on as a thin re-export
+> and will not get further fixes; upgrading also gets you the hosted defaults on
+> the current domain and an embed origin check that survives the redirect.
+
+**Spend-controlled [x402](https://www.x402.org) for AI agents.** Give an agent an *expense account* — an allowlist of endpoints plus per-call / per-day budgets — and let it pay any x402 service with no API keys. Enforcement is local and instant; every call emits a receipt. Built for [Pantessa](https://www.pantessa.com), MIT-licensed, works anywhere TypeScript does.
 
 ```bash
-npm install yeetful viem
+npm install pantessa viem
 ```
 
 ## Agent expense account
@@ -11,7 +17,7 @@ npm install yeetful viem
 Wrap your agent's calls in one grant-aware `pay()`. It refuses anything off the allowlist or over budget **before** signing a payment — your guardrail against runaway loops, bugs, and prompt-injected tool calls.
 
 ```ts
-import { yeetful, GrantError } from 'yeetful/agent'
+import { pantessa, GrantError } from 'pantessa/agent'
 import { createWalletClient, http } from 'viem'
 import { base } from 'viem/chains'
 import { privateKeyToAccount } from 'viem/accounts'
@@ -22,7 +28,7 @@ const wallet = createWalletClient({
   transport: http(),
 })
 
-const pay = yeetful({
+const pay = pantessa({
   wallet,
   grant: {
     allow: ['tripadvisor.x402.paysponge.com', 'anthropic.yeetful.com'],
@@ -44,17 +50,17 @@ try {
 }
 ```
 
-One grant authorizes **many** endpoints (the allowlist). Use `onReceipt` to stream the audit trail to your dashboard or the Yeetful control plane.
+One grant authorizes **many** endpoints (the allowlist). Use `onReceipt` to stream the audit trail to your dashboard or the Pantessa control plane.
 
 ### Hosted-ledger sync
 
-Mirror a grant you created at [yeetful.com](https://yeetful.com) and pass an API key (minted on the dashboard) — every receipt then syncs to your hosted ledger, so budgets and the audit feed include this agent's calls:
+Mirror a grant you created at [pantessa.com](https://www.pantessa.com) and pass an API key (minted on the dashboard) — every receipt then syncs to your hosted ledger, so budgets and the audit feed include this agent's calls:
 
 ```ts
-const pay = yeetful({
+const pay = pantessa({
   wallet,
   grant: { id: 'your-grant-id', allow: [...], perCallUsd: 0.05, perDayUsd: 2 },
-  apiKey: process.env.YEETFUL_API_KEY, // yf_…
+  apiKey: process.env.PANTESSA_API_KEY, // yf_…
 })
 // …
 await pay.flushLedger() // before a short-lived script exits
@@ -62,14 +68,14 @@ await pay.flushLedger() // before a short-lived script exits
 
 Sync is best-effort and never blocks or fails a payment; denials are synced too (`ok: false` with the violation code).
 
-> **`ledgerUrl` must be the canonical origin** (currently `https://www.yeetful.com`): `fetch` silently drops the `Authorization` header when it follows a cross-origin redirect such as apex → www. If sync or the policy fetch fails after a redirect, the `onEvent` log names the origin to use.
+> **`ledgerUrl` must be the canonical origin** (currently `https://www.pantessa.com`): `fetch` silently drops the `Authorization` header when it follows a cross-origin redirect such as apex → www. If sync or the policy fetch fails after a redirect, the `onEvent` log names the origin to use.
 
 ### Per-key agent budgets
 
-On yeetful.com an agent **is** an API key — the dashboard's Agents tab gives each key a per-day USD budget and a spent-today meter. When you pass `apiKey`, the SDK fetches the key's policy (`GET /api/agent/policy`) before the first payment and **refuses to pay** once the key is over budget, or when a call's quoted price would exceed what's left today:
+On pantessa.com an agent **is** an API key — the dashboard's Agents tab gives each key a per-day USD budget and a spent-today meter. When you pass `apiKey`, the SDK fetches the key's policy (`GET /api/agent/policy`) before the first payment and **refuses to pay** once the key is over budget, or when a call's quoted price would exceed what's left today:
 
 ```ts
-const pay = yeetful({ wallet, grant: { id: 'your-grant-id', ... }, apiKey: process.env.YEETFUL_API_KEY })
+const pay = pantessa({ wallet, grant: { id: 'your-grant-id', ... }, apiKey: process.env.PANTESSA_API_KEY })
 
 console.log(pay.agentBudget()) // { keyId, label, perDayUsd, spentTodayUsd, remainingTodayUsd, overBudget }
 // over budget → pay() throws GrantError('OVER_AGENT_BUDGET') and syncs the
@@ -82,13 +88,13 @@ Budgets are **advisory at the rails** — the agent pays from its own wallet, so
 
 ### Org budgets & remote pause (0.5)
 
-If the key belongs to an **organization** on yeetful.com, the same `apiKey` flow adds two more controls — fetched from the policy, refreshed on every sync echo, and enforced locally just like the per-key budget:
+If the key belongs to an **organization** on pantessa.com, the same `apiKey` flow adds two more controls — fetched from the policy, refreshed on every sync echo, and enforced locally just like the per-key budget:
 
 - **Two-level budget.** The org has a daily USD cap *above* each key's own budget — summed across all the org's agents. A call that would breach it throws `GrantError('OVER_ORG_BUDGET')`. Over **either** level stops the payment.
 - **Remote kill switch.** An admin can freeze a single agent (`AGENT_PAUSED`) or the whole expense account (`ACCOUNT_FROZEN`) from the dashboard. The SDK halts **all** payments while frozen — a hard stop above any budget arithmetic — and resumes automatically on the next policy refresh once unfrozen.
 
 ```ts
-const pay = yeetful({ wallet, grant: { id: 'your-org-grant-id', ... }, apiKey: process.env.YEETFUL_API_KEY })
+const pay = pantessa({ wallet, grant: { id: 'your-org-grant-id', ... }, apiKey: process.env.PANTESSA_API_KEY })
 
 pay.orgBudget() // { id, name, perDayUsd, spentTodayUsd, overBudget } | null (null for personal keys)
 pay.status()    // { halted, haltReason: 'AGENT_PAUSED' | 'ACCOUNT_FROZEN' | null }
@@ -97,7 +103,7 @@ pay.status()    // { halted, haltReason: 'AGENT_PAUSED' | 'ACCOUNT_FROZEN' | nul
 // agent/account paused → GrantError('AGENT_PAUSED' | 'ACCOUNT_FROZEN'), before any network call
 ```
 
-Same honesty as budgets: pause is advisory at the rails for SDK agents paying their own wallet (this local refusal is the enforcement); the chats Yeetful itself executes are hard-stopped server-side, and on-chain hard stops arrive with Spend Permissions.
+Same honesty as budgets: pause is advisory at the rails for SDK agents paying their own wallet (this local refusal is the enforcement); the chats Pantessa itself executes are hard-stopped server-side, and on-chain hard stops arrive with Spend Permissions.
 
 ---
 
@@ -107,7 +113,7 @@ The agent wrapper is built on a full x402 toolkit you can use directly:
 
 ```ts
 // Server — gate a route for 1¢ USDC
-import { withPayment } from 'yeetful/next'
+import { withPayment } from 'pantessa/next'
 
 export const GET = withPayment(
   { price: '0.01', recipient: '0xYourAddress', network: 'base' },
@@ -117,7 +123,7 @@ export const GET = withPayment(
 
 ```ts
 // Client — auto-pay when a server returns 402 (no grant enforcement)
-import { createPaymentClient } from 'yeetful/client'
+import { createPaymentClient } from 'pantessa/client'
 
 const pay = createPaymentClient({ wallet })
 const res = await pay('https://api.example.com/premium')
@@ -140,11 +146,11 @@ x402 is a reborn HTTP `402 Payment Required` — a protocol where servers quote 
 ## Install
 
 ```bash
-npm install yeetful viem
+npm install pantessa viem
 # or
-pnpm add yeetful viem
+pnpm add pantessa viem
 # or
-yarn add yeetful viem
+yarn add pantessa viem
 ```
 
 `viem` is a peer dependency so the SDK stays light and stays in sync with whatever viem version your app already uses.
@@ -159,7 +165,7 @@ yarn add yeetful viem
 
 ```ts
 // app/api/premium/route.ts
-import { withPayment } from 'yeetful/next'
+import { withPayment } from 'pantessa/next'
 
 export const GET = withPayment(
   {
@@ -178,7 +184,7 @@ export const GET = withPayment(
 
 ```ts
 import express from 'express'
-import { paymentRequired } from 'yeetful/express'
+import { paymentRequired } from 'pantessa/express'
 
 const app = express()
 
@@ -202,7 +208,7 @@ app.listen(3000)
 Use the runtime-agnostic `gate()` helper. Give it a standard `Request`, get back either a 402 `Response` or a `settle()` handle.
 
 ```ts
-import { gate } from 'yeetful/server'
+import { gate } from 'pantessa/server'
 
 export default {
   async fetch(request: Request) {
@@ -226,18 +232,18 @@ export default {
 
 ### Server: track earnings on your dashboard
 
-Claimed your MCP on [yeetful.com](https://www.yeetful.com)? Report each paid call so your earnings — total, last 30 days, calls served, paying agents — show up on your dashboard. `reportUsage()` is **fire-and-forget**: it never throws and never blocks, so call it after `settle()` and don't await it on the hot path (on serverless, hand it to `ctx.waitUntil(...)`).
+Claimed your MCP on [pantessa.com](https://www.pantessa.com)? Report each paid call so your earnings — total, last 30 days, calls served, paying agents — show up on your dashboard. `reportUsage()` is **fire-and-forget**: it never throws and never blocks, so call it after `settle()` and don't await it on the hot path (on serverless, hand it to `ctx.waitUntil(...)`).
 
 ```ts
-import { gate, reportUsage } from 'yeetful/server'
+import { gate, reportUsage } from 'pantessa/server'
 
 const { payer, settle } = /* …from gate() … */
 const { header, result } = await settle()
 
 // non-blocking — do NOT await on the request's critical path
 reportUsage({
-  apiKey: process.env.YEETFUL_API_KEY!, // a yf_… key from dashboard/keys
-  mcp: 'your-server-slug',              // your slug on yeetful.com/servers/<slug>
+  apiKey: process.env.PANTESSA_API_KEY!, // a yf_… key from dashboard/keys
+  mcp: 'your-server-slug',              // your slug on pantessa.com/servers/<slug>
   amountUsd: 0.01,
   payer,
   tool: 'list_proposals',
@@ -245,12 +251,12 @@ reportUsage({
 })
 ```
 
-Full walk-through: [yeetful.com/docs/earn](https://www.yeetful.com/docs/earn).
+Full walk-through: [pantessa.com/docs/earn](https://www.pantessa.com/docs/earn).
 
 ### Client: auto-pay
 
 ```ts
-import { createPaymentClient } from 'yeetful/client'
+import { createPaymentClient } from 'pantessa/client'
 
 const pay = createPaymentClient({
   wallet,                           // any viem WalletClient
@@ -350,7 +356,7 @@ Clients automatically pick the cheapest network they're configured to use.
 ### Sign a payment manually
 
 ```ts
-import { signPayment } from 'yeetful/client'
+import { signPayment } from 'pantessa/client'
 
 const payment = await signPayment(wallet, {
   scheme: 'exact',
@@ -363,13 +369,13 @@ const payment = await signPayment(wallet, {
 
 ### Use with AI agents / MCP tools
 
-x402 is a natural fit for agent tooling — drop `withPayment` in front of any MCP tool endpoint and agents with wallets can pay per-call. This SDK is what powers paid tools on [Yeetful](https://yeetful.com).
+x402 is a natural fit for agent tooling — drop `withPayment` in front of any MCP tool endpoint and agents with wallets can pay per-call. This SDK is what powers paid tools on [Pantessa](https://www.pantessa.com).
 
 ---
 
 ## Embed the chat
 
-`yeetful/embed` drops the Yeetful chat into any webpage as an iframe — zero
+`pantessa/embed` drops the Pantessa chat into any webpage as an iframe — zero
 dependencies, framework-agnostic, browser-only (it never imports viem or the
 payment stack). Scope it to up to 4 MCPs with `mcps`, or float it as a
 bottom-right bubble with `mode: 'bubble'`.
@@ -377,16 +383,16 @@ bottom-right bubble with `mode: 'bubble'`.
 Plain script tag:
 
 ```html
-<div id="yeetful-chat" style="height: 560px"></div>
+<div id="pantessa-chat" style="height: 560px"></div>
 <script type="module">
-  import { mountYeetfulChat } from 'https://esm.sh/yeetful/embed'
+  import { mountPantessaChat } from 'https://esm.sh/pantessa/embed'
 
-  const chat = mountYeetfulChat({
-    container: '#yeetful-chat',        // element or selector (inline mode)
+  const chat = mountPantessaChat({
+    container: '#pantessa-chat',        // element or selector (inline mode)
     mcps: ['uniswap-free'],            // scope the chat to these MCPs (≤4)
     wallet: 'auto',                    // bridge window.ethereum into the chat (the default)
     theme: 'dark',
-    onEvent: (name, data) => console.log('yeetful event', name, data),
+    onEvent: (name, data) => console.log('pantessa event', name, data),
   })
   // later: chat.sendPrompt('…') · chat.destroy()
 </script>
@@ -410,14 +416,14 @@ connected account:
 
 ```tsx
 import { useEffect, useRef } from 'react'
-import { mountYeetfulChat, type YeetfulChatHandle } from 'yeetful/embed'
+import { mountPantessaChat, type PantessaChatHandle } from 'pantessa/embed'
 
-function YeetfulChat({ address }: { address?: string }) {
+function PantessaChat({ address }: { address?: string }) {
   const ref = useRef<HTMLDivElement>(null)
-  const chat = useRef<YeetfulChatHandle | null>(null)
+  const chat = useRef<PantessaChatHandle | null>(null)
 
   useEffect(() => {
-    chat.current = mountYeetfulChat({
+    chat.current = mountPantessaChat({
       container: ref.current!,
       mcps: ['cow-swap'],
       address,               // initial context goes in the URL
@@ -434,7 +440,7 @@ function YeetfulChat({ address }: { address?: string }) {
 }
 ```
 
-`mountYeetfulChat(options)` returns a handle: `{ iframe, setAddress, setTheme,
+`mountPantessaChat(options)` returns a handle: `{ iframe, setAddress, setTheme,
 sendPrompt, open, close, destroy }`. `open`/`close` drive the bubble panel
 (no-ops inline); `sendPrompt(text)` injects a prompt as the user's message —
 wire it to host CTAs like an "ask about this order" button (pass
@@ -447,31 +453,31 @@ with an explicit `targetOrigin` (never `'*'`).
 
 ## API reference
 
-### `yeetful/server`
+### `pantessa/server`
 
 - `gate(request, options)` — runtime-agnostic. Returns `{ type: 'paymentRequired', response }` or `{ type: 'ok', payer, settle }`.
-- `reportUsage(options)` — fire-and-forget earn-side receipt to your Yeetful dashboard. Never throws; resolves `true` on a 2xx.
+- `reportUsage(options)` — fire-and-forget earn-side receipt to your Pantessa dashboard. Never throws; resolves `true` on a 2xx.
 - `Facilitator` — thin wrapper around verify/settle HTTP endpoints.
 - `DEFAULT_FACILITATOR_URL` — the hosted facilitator URL.
 - `DEFAULT_RECEIPTS_URL` — the hosted earn-side ingestion URL.
 
-### `yeetful/next`
+### `pantessa/next`
 
 - `withPayment(options, handler)` — wraps a Next.js route handler.
 
-### `yeetful/express`
+### `pantessa/express`
 
 - `paymentRequired(options)` — returns an Express `RequestHandler`. Sets `req.x402.payer` after successful verification.
 
-### `yeetful/client`
+### `pantessa/client`
 
 - `createPaymentClient(options)` — returns a `fetch`-compatible function that handles 402s automatically.
 - `signPayment(wallet, requirement)` — sign a payment payload by hand.
 - `PaymentError` — thrown when the client declines to pay.
 
-### `yeetful/embed`
+### `pantessa/embed`
 
-- `mountYeetfulChat(options)` — mounts the Yeetful chat iframe (inline or bubble); returns a `YeetfulChatHandle` (`setAddress` / `setTheme` / `sendPrompt` / `open` / `close` / `destroy`). Browser-only, zero deps. `options.wallet: 'auto' | Eip1193Provider | false` (default `'auto'`) bridges the host page's wallet provider into the chat — allowlisted EIP-1193 methods are relayed over `postMessage`; signatures/txs always pop the user's own wallet UI.
+- `mountPantessaChat(options)` — mounts the Pantessa chat iframe (inline or bubble); returns a `PantessaChatHandle` (`setAddress` / `setTheme` / `sendPrompt` / `open` / `close` / `destroy`). Browser-only, zero deps. `options.wallet: 'auto' | Eip1193Provider | false` (default `'auto'`) bridges the host page's wallet provider into the chat — allowlisted EIP-1193 methods are relayed over `postMessage`; signatures/txs always pop the user's own wallet UI.
 
 ### Helpers
 
@@ -501,4 +507,4 @@ npm publish
 
 ## License
 
-MIT © Yeetful
+MIT © Pantessa

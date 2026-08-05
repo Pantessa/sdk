@@ -1,0 +1,47 @@
+{
+  "name": "yeetful",
+  "version": "0.11.0",
+  "description": "DEPRECATED — renamed to `pantessa`. This package re-exports it unchanged; run `npm i pantessa` and swap your import specifier.",
+  "keywords": [
+    "deprecated",
+    "pantessa",
+    "x402",
+    "ai-agents",
+    "agent-payments"
+  ],
+  "homepage": "https://www.pantessa.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yeetful/sdk.git",
+    "directory": "compat/yeetful"
+  },
+  "license": "MIT",
+  "author": "Pantessa",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./agent": "./agent.js",
+    "./client": "./client.js",
+    "./server": "./server.js",
+    "./next": "./next.js",
+    "./express": "./express.js",
+    "./embed": "./embed.js"
+  },
+  "files": [
+    "*.js",
+    "*.d.ts",
+    "README.md"
+  ],
+  "dependencies": {
+    "pantessa": "^1.0.0"
+  },
+  "peerDependencies": {
+    "viem": "^2.21.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

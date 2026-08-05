@@ -1,18 +1,22 @@
 /**
- * Yeetful — spend-controlled x402 for AI agents.
+ * Pantessa — spend-controlled x402 for AI agents.
+ *
+ * Published as `pantessa`; the pre-rebrand `yeetful` package is a deprecated
+ * re-export of this one. Every renamed export keeps its old name as a
+ * deprecated alias, so upgrading is a package swap, not a code change.
  *
  * Top-level entry re-exports the most common primitives. Use the subpath
  * entries for the agent expense account and framework-specific helpers:
  *
- *   - `yeetful/agent`   → grant-aware `yeetful()` paid fetch (the expense account)
- *   - `yeetful/client`  → low-level client-side fetch wrapper
- *   - `yeetful/server`  → runtime-agnostic `gate()`
- *   - `yeetful/next`    → Next.js App Router `withPayment()`
- *   - `yeetful/express` → Express `paymentRequired()` middleware
- *   - `yeetful/embed`   → browser-only `mountYeetfulChat()` chat-iframe helper
+ *   - `pantessa/agent`   → grant-aware `pantessa()` paid fetch (expense account)
+ *   - `pantessa/client`  → low-level client-side fetch wrapper
+ *   - `pantessa/server`  → runtime-agnostic `gate()`
+ *   - `pantessa/next`    → Next.js App Router `withPayment()`
+ *   - `pantessa/express` → Express `paymentRequired()` middleware
+ *   - `pantessa/embed`   → browser-only `mountPantessaChat()` chat-iframe helper
  */
 
-export { yeetful, GrantError } from './agent.js'
+export { pantessa, yeetful, DEFAULT_LEDGER_URL, GrantError } from './agent.js'
 export type {
   AgentBudget,
   AgentOptions,

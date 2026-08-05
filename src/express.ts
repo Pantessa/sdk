@@ -13,7 +13,7 @@ declare module 'express-serve-static-core' {
  * @example
  * ```ts
  * import express from 'express'
- * import { paymentRequired } from 'yeetful/express'
+ * import { paymentRequired } from 'pantessa/express'
  *
  * const app = express()
  * app.get(
