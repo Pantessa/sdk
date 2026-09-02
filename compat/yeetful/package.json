@@ -12,7 +12,7 @@
   "homepage": "https://www.pantessa.com",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Yeetful/sdk.git",
+    "url": "git+https://github.com/Pantessa/sdk.git",
     "directory": "compat/yeetful"
   },
   "license": "MIT",
