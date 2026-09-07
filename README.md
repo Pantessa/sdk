@@ -1,505 +1,343 @@
 # pantessa
 
-> **Renamed from `yeetful`.** Yeetful is now Pantessa. `npm i pantessa && npm rm yeetful`,
-> swap the import specifier, and you're done — every renamed export keeps its old
-> name as a deprecated alias. The `yeetful` package lives on as a thin re-export
-> and will not get further fixes; upgrading also gets you the hosted defaults on
-> the current domain and an embed origin check that survives the redirect.
-
-**Spend-controlled [x402](https://www.x402.org) for AI agents.** Give an agent an *expense account* — an allowlist of endpoints plus per-call / per-day budgets — and let it pay any x402 service with no API keys. Enforcement is local and instant; every call emits a receipt. Built for [Pantessa](https://www.pantessa.com), MIT-licensed, works anywhere TypeScript does.
+**The Pantessa SDK.** Put the Pantessa agent on your own site — a chat that turns
+a sentence like *"buy $10 of AAPL"* or *"stake 0.05 ETH with Lido"* into a
+guarded, receipt-backed transaction the visitor signs with their own wallet, on
+your page. Underneath it, the x402 primitives Pantessa runs on, so your agents
+and services can pay and get paid per call.
 
 ```bash
 npm install pantessa viem
 ```
 
-## Agent expense account
+> **Renamed from `yeetful`.** `npm i pantessa && npm rm yeetful`, swap the import
+> specifier, done — every renamed export keeps its old name as a deprecated
+> alias. The `yeetful` package is a frozen re-export and gets no further fixes.
 
-Wrap your agent's calls in one grant-aware `pay()`. It refuses anything off the allowlist or over budget **before** signing a payment — your guardrail against runaway loops, bugs, and prompt-injected tool calls.
-
-```ts
-import { pantessa, GrantError } from 'pantessa/agent'
-import { createWalletClient, http } from 'viem'
-import { base } from 'viem/chains'
-import { privateKeyToAccount } from 'viem/accounts'
-
-const wallet = createWalletClient({
-  account: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
-  chain: base,
-  transport: http(),
-})
-
-const pay = pantessa({
-  wallet,
-  grant: {
-    allow: ['tripadvisor.x402.paysponge.com', 'anthropic.yeetful.com'],
-    perCallUsd: 0.05,
-    perDayUsd: 2,
-    expiresAt: '2026-12-31',
-  },
-  onReceipt: (r) => console.log(r.host, `$${r.amountUsd}`, r.txHash ?? r.note),
-})
-
-try {
-  const res = await pay('https://tripadvisor.x402.paysponge.com/api/v1/location/search?searchQuery=tokyo')
-  console.log(await res.json())
-  console.log(`spent today: $${pay.spentTodayUsd()} / left: $${pay.remainingTodayUsd()}`)
-} catch (e) {
-  // GrantError.code: NOT_ALLOWED | OVER_PER_CALL | BUDGET_EXCEEDED | EXPIRED | REVOKED
-  //   | OVER_AGENT_BUDGET | OVER_ORG_BUDGET | AGENT_PAUSED | ACCOUNT_FROZEN
-  if (e instanceof GrantError) console.error(`blocked: ${e.code}`)
-}
-```
-
-One grant authorizes **many** endpoints (the allowlist). Use `onReceipt` to stream the audit trail to your dashboard or the Pantessa control plane.
-
-### Hosted-ledger sync
-
-Mirror a grant you created at [pantessa.com](https://www.pantessa.com) and pass an API key (minted on the dashboard) — every receipt then syncs to your hosted ledger, so budgets and the audit feed include this agent's calls:
-
-```ts
-const pay = pantessa({
-  wallet,
-  grant: { id: 'your-grant-id', allow: [...], perCallUsd: 0.05, perDayUsd: 2 },
-  apiKey: process.env.PANTESSA_API_KEY, // yf_…
-})
-// …
-await pay.flushLedger() // before a short-lived script exits
-```
-
-Sync is best-effort and never blocks or fails a payment; denials are synced too (`ok: false` with the violation code).
-
-> **`ledgerUrl` must be the canonical origin** (currently `https://www.pantessa.com`): `fetch` silently drops the `Authorization` header when it follows a cross-origin redirect such as apex → www. If sync or the policy fetch fails after a redirect, the `onEvent` log names the origin to use.
-
-### Per-key agent budgets
-
-On pantessa.com an agent **is** an API key — the dashboard's Agents tab gives each key a per-day USD budget and a spent-today meter. When you pass `apiKey`, the SDK fetches the key's policy (`GET /api/agent/policy`) before the first payment and **refuses to pay** once the key is over budget, or when a call's quoted price would exceed what's left today:
-
-```ts
-const pay = pantessa({ wallet, grant: { id: 'your-grant-id', ... }, apiKey: process.env.PANTESSA_API_KEY })
-
-console.log(pay.agentBudget()) // { keyId, label, perDayUsd, spentTodayUsd, remainingTodayUsd, overBudget }
-// over budget → pay() throws GrantError('OVER_AGENT_BUDGET') and syncs the
-// denial receipt, so the refusal shows up in the dashboard audit trail.
-```
-
-Budgets are **advisory at the rails** — the agent pays from its own wallet, so this local refusal is the enforcement point. The snapshot stays fresh opportunistically: receipt-sync responses echo the updated budget, `flushLedger()` re-fetches the policy (picking up mid-run dashboard edits), and settled-but-unsynced spend is counted locally in between. If the policy can't be fetched at all, payments proceed under the grant alone.
-
-> **Local vs. hard enforcement.** This SDK enforces the grant in-process — ideal for governing *your own* agents (runaway loops, bugs, injected tool calls). For adversarial guarantees, back the grant with an on-chain Coinbase **Spend Permission** so the wallet contract caps spend regardless of the SDK.
-
-### Org budgets & remote pause (0.5)
-
-If the key belongs to an **organization** on pantessa.com, the same `apiKey` flow adds two more controls — fetched from the policy, refreshed on every sync echo, and enforced locally just like the per-key budget:
-
-- **Two-level budget.** The org has a daily USD cap *above* each key's own budget — summed across all the org's agents. A call that would breach it throws `GrantError('OVER_ORG_BUDGET')`. Over **either** level stops the payment.
-- **Remote kill switch.** An admin can freeze a single agent (`AGENT_PAUSED`) or the whole expense account (`ACCOUNT_FROZEN`) from the dashboard. The SDK halts **all** payments while frozen — a hard stop above any budget arithmetic — and resumes automatically on the next policy refresh once unfrozen.
-
-```ts
-const pay = pantessa({ wallet, grant: { id: 'your-org-grant-id', ... }, apiKey: process.env.PANTESSA_API_KEY })
-
-pay.orgBudget() // { id, name, perDayUsd, spentTodayUsd, overBudget } | null (null for personal keys)
-pay.status()    // { halted, haltReason: 'AGENT_PAUSED' | 'ACCOUNT_FROZEN' | null }
-
-// org over its cap   → GrantError('OVER_ORG_BUDGET')
-// agent/account paused → GrantError('AGENT_PAUSED' | 'ACCOUNT_FROZEN'), before any network call
-```
-
-Same honesty as budgets: pause is advisory at the rails for SDK agents paying their own wallet (this local refusal is the enforcement); the chats Pantessa itself executes are hard-stopped server-side, and on-chain hard stops arrive with Spend Permissions.
+- [Embed the chat](#embed-the-chat) — `pantessa/embed`, five lines, any site
+- [No-code paths](#no-code-paths) — intent links, host buttons, deep links
+- [Pay and get paid with x402](#pay-and-get-paid-with-x402) — gate a route, auto-pay a client, give an agent an expense account
+- [API reference](#api-reference)
 
 ---
 
-## Low-level x402 primitives
-
-The agent wrapper is built on a full x402 toolkit you can use directly:
-
-```ts
-// Server — gate a route for 1¢ USDC
-import { withPayment } from 'pantessa/next'
-
-export const GET = withPayment(
-  { price: '0.01', recipient: '0xYourAddress', network: 'base' },
-  async () => Response.json({ secret: 'gm' })
-)
-```
-
-```ts
-// Client — auto-pay when a server returns 402 (no grant enforcement)
-import { createPaymentClient } from 'pantessa/client'
-
-const pay = createPaymentClient({ wallet })
-const res = await pay('https://api.example.com/premium')
-console.log(await res.json()) // → { secret: 'gm' }
-```
-
----
-
-## Why x402?
-
-x402 is a reborn HTTP `402 Payment Required` — a protocol where servers quote a price, clients sign a stablecoin authorization, and a facilitator settles on-chain. No accounts, no Stripe dashboards, no webhook retries. Works on EVM chains today (USDC on Base, Optimism, Arbitrum, Polygon, Ethereum).
-
-**You get:**
-- Per-request pricing for any API — LLM calls, data feeds, premium endpoints, MCP tools.
-- One-sentence paywalls for agents: an LLM with a wallet can now pay for what it uses.
-- Instant settlement on L2 — no chargebacks, no holds, no 30-day payout delay.
-
----
-
-## Install
-
-```bash
-npm install pantessa viem
-# or
-pnpm add pantessa viem
-# or
-yarn add pantessa viem
-```
-
-`viem` is a peer dependency so the SDK stays light and stays in sync with whatever viem version your app already uses.
-
----
-
-## Quickstart
-
-### Server: gate a route
-
-#### Next.js (App Router)
-
-```ts
-// app/api/premium/route.ts
-import { withPayment } from 'pantessa/next'
-
-export const GET = withPayment(
-  {
-    price: '0.01',                        // USD
-    recipient: '0xYourWalletAddress',     // gets paid
-    network: 'base',                      // or ['base', 'optimism']
-    description: 'Premium GM endpoint',
-  },
-  async (req) => {
-    return Response.json({ message: 'gm, thanks for the cent' })
-  }
-)
-```
-
-#### Express
-
-```ts
-import express from 'express'
-import { paymentRequired } from 'pantessa/express'
-
-const app = express()
-
-app.get(
-  '/premium',
-  paymentRequired({
-    price: '0.01',
-    recipient: '0xYourWalletAddress',
-    network: 'base',
-  }),
-  (req, res) => {
-    res.json({ message: 'gm', payer: req.x402?.payer })
-  }
-)
-
-app.listen(3000)
-```
-
-#### Anywhere else (Hono, Bun, Cloudflare Workers, raw Node)
-
-Use the runtime-agnostic `gate()` helper. Give it a standard `Request`, get back either a 402 `Response` or a `settle()` handle.
-
-```ts
-import { gate } from 'pantessa/server'
-
-export default {
-  async fetch(request: Request) {
-    const result = await gate(request, {
-      price: '0.01',
-      recipient: '0xYourWalletAddress',
-      network: 'base',
-    })
-
-    if (result.type === 'paymentRequired') return result.response
-
-    // …do the paid work…
-    const body = Response.json({ message: 'gm' })
-
-    const { header } = await result.settle()
-    body.headers.set('X-PAYMENT-RESPONSE', header)
-    return body
-  },
-}
-```
-
-### Server: track earnings on your dashboard
-
-Claimed your MCP on [pantessa.com](https://www.pantessa.com)? Report each paid call so your earnings — total, last 30 days, calls served, paying agents — show up on your dashboard. `reportUsage()` is **fire-and-forget**: it never throws and never blocks, so call it after `settle()` and don't await it on the hot path (on serverless, hand it to `ctx.waitUntil(...)`).
-
-```ts
-import { gate, reportUsage } from 'pantessa/server'
-
-const { payer, settle } = /* …from gate() … */
-const { header, result } = await settle()
-
-// non-blocking — do NOT await on the request's critical path
-reportUsage({
-  apiKey: process.env.PANTESSA_API_KEY!, // a yf_… key from dashboard/keys
-  mcp: 'your-server-slug',              // your slug on pantessa.com/servers/<slug>
-  amountUsd: 0.01,
-  payer,
-  tool: 'list_proposals',
-  network: 'base',
-})
-```
-
-Full walk-through: [pantessa.com/docs/earn](https://www.pantessa.com/docs/earn).
-
-### Client: auto-pay
-
-```ts
-import { createPaymentClient } from 'pantessa/client'
-
-const pay = createPaymentClient({
-  wallet,                           // any viem WalletClient
-  maxAmountAtomic: 1_000_000n,      // cap: 1 USDC per call
-  allowedNetworks: ['base'],        // only pay on Base
-  onPaymentRequired: async (req) => {
-    console.log(`Pay ${req.maxAmountRequired} to ${req.payTo}?`)
-    return true                     // return false to cancel
-  },
-})
-
-// Use exactly like fetch.
-const res = await pay('https://api.example.com/premium')
-```
-
----
-
-## Configuration
-
-### `RouteGateOptions` — server
-
-| Option | Type | Default | Notes |
-| --- | --- | --- | --- |
-| `price` | `string \| number` | **required** | USD amount, e.g. `'0.01'`. Converted to USDC atomic units. |
-| `recipient` | `Address` | **required** | Address that receives the payment. |
-| `network` | `X402Network \| X402Network[]` | `'base'` | Networks you'll accept. Multi-chain = multi-item discovery. |
-| `asset` | `Address` | USDC for network | Override to use a different ERC-20. |
-| `description` | `string` | — | Shown to the paying client. |
-| `maxTimeoutSeconds` | `number` | `600` | Validity window of the signed authorization. |
-| `facilitator` | `FacilitatorConfig \| false` | hosted facilitator | Pass `false` to skip on-chain settlement (testing only). |
-
-Supported networks: `base`, `base-sepolia`, `ethereum`, `optimism`, `arbitrum`, `polygon`.
-
-### `ClientOptions` — client
-
-| Option | Type | Notes |
-| --- | --- | --- |
-| `wallet` | `WalletClient` | Any viem wallet capable of signing EIP-712 typed data. |
-| `maxAmountAtomic` | `bigint` | Reject requirements above this cap — safety belt. |
-| `allowedNetworks` | `X402Network[]` | Only pay on these networks. |
-| `onPaymentRequired` | `(req) => boolean \| Promise<boolean>` | Approval hook; return `false` to cancel. |
-| `fetch` | `typeof fetch` | Override the underlying fetch (e.g. for timeouts). |
-
----
-
-## How it works
-
-1. **Client requests** a paid resource normally.
-2. **Server** responds with `402 Payment Required` and a JSON body listing acceptable requirements (network, asset, amount, recipient).
-3. **Client** picks the cheapest requirement, signs an [EIP-3009 `TransferWithAuthorization`](https://eips.ethereum.org/EIPS/eip-3009) with the user's wallet, and retries the request with an `X-PAYMENT` header (base64 JSON).
-4. **Server** hands the signed payload to a facilitator which `verify`s the signature and `settle`s the transfer on-chain.
-5. **Server** runs the handler and returns the response with an `X-PAYMENT-RESPONSE` header containing the transaction hash.
-
-The signing is gasless for the payer — the facilitator broadcasts the transfer and picks up gas.
-
----
-
-## Facilitators
-
-By default the SDK uses the hosted facilitator at `https://facilitator.yeetful.com`. Override it anywhere you configure the server:
-
-```ts
-withPayment(
-  {
-    price: '0.01',
-    recipient: '0xYourAddress',
-    facilitator: {
-      url: 'https://your-facilitator.example.com',
-      authHeader: 'Bearer your-token',
-    },
-  },
-  handler,
-)
-```
-
-Pass `facilitator: false` to skip verification and settlement entirely — only useful for local testing.
-
----
-
-## Advanced
-
-### Accept multiple networks
-
-```ts
-withPayment(
-  {
-    price: '0.01',
-    recipient: '0xYourAddress',
-    network: ['base', 'optimism', 'arbitrum'],
-  },
-  handler,
-)
-```
-
-Clients automatically pick the cheapest network they're configured to use.
-
-### Sign a payment manually
-
-```ts
-import { signPayment } from 'pantessa/client'
-
-const payment = await signPayment(wallet, {
-  scheme: 'exact',
-  network: 'base',
-  asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
-  maxAmountRequired: '10000', // 0.01 USDC
-  payTo: '0xRecipient',
-})
-```
-
-### Use with AI agents / MCP tools
-
-x402 is a natural fit for agent tooling — drop `withPayment` in front of any MCP tool endpoint and agents with wallets can pay per-call. This SDK is what powers paid tools on [Pantessa](https://www.pantessa.com).
+## What runs inside the embed
+
+The chat is Pantessa's **native transaction layer**: a planner picks the shape of
+the ask, a per-venue builder produces the exact calldata or typed data
+(the model never writes an address or a byte of calldata), one shared guardrail
+gate re-decodes and re-prices every artifact before it is offered, and the
+visitor's wallet signs. Receipts land in the thread and in your dashboard.
+
+What it builds today: Uniswap v3/v4 swaps and CoW orders, tokenized-stock trades
+on Robinhood Chain, Aave supply/borrow/repay, Lido staking, Hyperliquid perps
+with an autonomous stop-loss/take-profit guardian, NFT sells and buys on
+OpenSea, cross-chain moves through NEAR Intents, funding plans when the money is
+on the wrong chain, recurring buys (DCA), and multi-step jobs that chain all of
+the above. Swaps carry a small venue-native fee (0.20% in the chat); everything else is free.
+Details: [pantessa.com/docs/transactions](https://www.pantessa.com/docs/transactions)
+· [the trust model](https://www.pantessa.com/docs/trust).
 
 ---
 
 ## Embed the chat
 
-`pantessa/embed` drops the Pantessa chat into any webpage as an iframe — zero
-dependencies, framework-agnostic, browser-only (it never imports viem or the
-payment stack). Scope it to up to 4 MCPs with `mcps`, or float it as a
-bottom-right bubble with `mode: 'bubble'`.
+`pantessa/embed` drops the chat into any page as an iframe. Framework-agnostic,
+dependency-free, browser-only — it never imports viem or the payment stack, so
+it is safe to load on any host page. Scope it to up to four MCPs with `mcps`, or
+run it on the default set.
 
-Plain script tag:
+### Plain script
 
 ```html
-<div id="pantessa-chat" style="height: 560px"></div>
+<div id="pantessa-chat" style="height: 640px"></div>
 <script type="module">
-  import { mountPantessaChat } from 'https://esm.sh/pantessa/embed'
+  import { mountPantessaChat } from 'https://esm.sh/pantessa@^1/embed'
 
   const chat = mountPantessaChat({
-    container: '#pantessa-chat',        // element or selector (inline mode)
-    mcps: ['uniswap-free'],            // scope the chat to these MCPs (≤4)
-    wallet: 'auto',                    // bridge window.ethereum into the chat (the default)
-    theme: 'dark',
-    onEvent: (name, data) => console.log('pantessa event', name, data),
+    container: '#pantessa-chat',      // element or selector (inline mode)
+    mcps: ['robinhood-free', 'uniswap-free'],
+    key: 'yfe_…',                     // PUBLIC embed key (optional, see below)
+    wallet: 'auto',                   // bridge window.ethereum (the default)
+    theme: 'light',
+    onEvent: (name, data) => console.log(name, data),
   })
-  // later: chat.sendPrompt('…') · chat.destroy()
+
+  // any button on your page becomes an ask
+  chat.sendPrompt('Buy $10 of AAPL on Robinhood Chain')
 </script>
 ```
 
-**The host-wallet bridge** (`wallet`, new in 0.9): the SDK relays the host
-page's EIP-1193 provider into the iframe over `postMessage`, so the embedded
-chat can request accounts, read balances, and pop the user's own wallet for
-signatures — no separate connect flow inside the embed. The host page already
-holds that provider, so the bridge grants the embed the same dapp-level access
-the host has, nothing more: every signature/transaction still opens the USER's
-wallet UI for approval, relayed reads are restricted to a strict method
-allowlist, and no private key material ever crosses the frame. `'auto'`
-(default) uses `window.ethereum` when present; pass a provider (e.g. from
-wagmi) or `false` to turn the bridge off. `setAddress` remains for
-context-only hosts that just want to tell the chat which address to talk
-about without wiring a wallet.
+`mode: 'bubble'` floats a bottom-right launcher instead of filling a container.
 
-React (your own trading UI), mounting in a `useEffect` and syncing the
-connected account:
+### React
+
+Mount once in an effect and destroy in its cleanup (StrictMode double-runs
+effects in dev; `destroy()` makes that harmless).
 
 ```tsx
 import { useEffect, useRef } from 'react'
-import { mountPantessaChat, type PantessaChatHandle } from 'pantessa/embed'
+import { mountPantessaChat, type Eip1193Provider, type PantessaChatHandle } from 'pantessa/embed'
 
-function PantessaChat({ address }: { address?: string }) {
-  const ref = useRef<HTMLDivElement>(null)
+export function PantessaChat({ provider }: { provider?: Eip1193Provider }) {
+  const el = useRef<HTMLDivElement>(null)
   const chat = useRef<PantessaChatHandle | null>(null)
 
   useEffect(() => {
     chat.current = mountPantessaChat({
-      container: ref.current!,
-      mcps: ['cow-swap'],
-      address,               // initial context goes in the URL
-      theme: 'dark',
+      container: el.current!,
+      mcps: ['robinhood-free', 'uniswap-free'],
+      wallet: provider ?? 'auto',
+      theme: 'light',
     })
     return () => chat.current?.destroy()
-  }, []) // mount once
+  }, []) // once — see "one mount, any wallet" below
 
-  useEffect(() => {
-    chat.current?.setAddress(address ?? null) // queued until the embed is ready
-  }, [address])
-
-  return <div ref={ref} style={{ height: 560 }} />
+  return <div ref={el} style={{ height: 640 }} />
 }
 ```
 
-Users usually pick a wallet *after* the chat is on screen, and `wallet` is
-captured at mount. Hand the SDK a provider that survives that — a small
-EIP-1193 facade that forwards `request` to whichever wallet is selected and
-emits `accountsChanged` / `chainChanged` itself when the selection changes —
-rather than remounting (a remount drops the conversation). The
-[robinhood-desk example](https://github.com/Pantessa/agent-examples/tree/main/agents/robinhood-desk)
-does exactly this (EIP-6963 discovery included) and is a complete host app:
-holdings read from the chain, every button a `sendPrompt`, an activity log
-built from the `onEvent` stream, a real CSP, and a jsdom test of the wire.
+### Options
 
-`onEvent(name, data)` receives `turn` once per chat turn —
-`{ outcome, artifact?, valueUsd?, txUrl?, chainId? }`, outcomes `answered ·
-tx-built · signed · settled · clarify · refused · credit-gate · error` — and
-`order-signed` when a CoW / Hyperliquid order signs. Enough for a host-side
-funnel without touching the chat's internals.
+| Option | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `container` | `HTMLElement \| string` | — | Required for `mode: 'inline'`. The iframe fills it. |
+| `mode` | `'inline' \| 'bubble'` | `'inline'` | Fill the container, or float a launcher + panel. |
+| `mcps` | `string[]` | the default set | Directory slugs from [pantessa.com/servers](https://www.pantessa.com/servers), max 4. |
+| `key` | `string` | — | Your **public** `yfe_` embed key. Attributes sessions to your account and bills house-model answers to your plan instead of each visitor's free tier. Safe in page source. |
+| `wallet` | `'auto' \| Eip1193Provider \| false` | `'auto'` | Bridge the page's wallet into the chat. `'auto'` uses `window.ethereum`; pass a provider (wagmi, EIP-6963) to choose; `false` turns the bridge off. |
+| `address` | `string` | — | Context-only address (what "my portfolio" means) for hosts that don't bridge a wallet. |
+| `theme` | `'dark' \| 'light'` | `'dark'` | |
+| `origin` | `string` | `https://www.pantessa.com` | Only for self-hosted or local builds of the chat. |
+| `onEvent` | `(name, data) => void` | — | The event stream, below. |
+| `onReady` | `() => void` | — | Fires once the iframe has mounted and the handshake completed. |
+| `zIndex` | `number` | `2147483000` | Bubble mode stacking. |
 
-`mountPantessaChat(options)` returns a handle: `{ iframe, setAddress, setTheme,
-sendPrompt, open, close, destroy }`. `open`/`close` drive the bubble panel
-(no-ops inline); `sendPrompt(text)` injects a prompt as the user's message —
-wire it to host CTAs like an "ask about this order" button (pass
-`{ submit: false }` to only prefill the input); `destroy` removes all DOM
-nodes and listeners. Security: the parent only accepts `postMessage` events
-from the embed origin with `source: 'yeetful-embed'`, and always posts back
-with an explicit `targetOrigin` (never `'*'`).
+The handle: `sendPrompt(text, { submit?: boolean })` (submit as the visitor's
+message, or only prefill with `submit: false`), `setAddress(address | null)`,
+`setTheme(theme)`, `open()` / `close()` (bubble), `destroy()`, and the raw
+`iframe`. Calls made before `ready` are queued.
+
+### Events
+
+`onEvent` receives `turn` once per chat turn and `order-signed` when a CoW or
+Hyperliquid order signs:
+
+```ts
+// name: 'turn'
+{ outcome: 'answered' | 'tx-built' | 'signed' | 'settled' | 'clarify' | 'refused' | 'credit-gate' | 'error',
+  artifact?: 'tx' | 'tx-chain' | 'job' | 'cow-order' | 'hl-order' | 'vote',
+  valueUsd?: number,      // guardrail-priced notional
+  txUrl?: string,         // explorer link when there is a receipt
+  chainId?: number,
+  jobId?: string }
+
+// name: 'order-signed'
+{ artifact: 'cow-order' | 'hl-order', valueUsd?: number, txUrl?: string }
+```
+
+That is enough for a host-side activity log or a connect → ask → build → sign
+funnel without touching the chat's internals. With an embed key, the same
+turns feed [your dashboard](https://www.pantessa.com/dashboard/embeds): money
+moved, the funnel per page, and dead-end sessions with the verbatim asks.
+
+### The wallet bridge
+
+With `wallet` set, the SDK relays the host page's EIP-1193 provider into the
+iframe over `postMessage`. The chat becomes really wallet-connected — swaps,
+transactions, and orders sign through the visitor's own wallet, **prompting on
+your page**, never inside the frame. There is no separate connect flow in the
+embed.
+
+Security model: the bridge grants the iframe the same dapp-level access your
+page already has, nothing more. Relayed methods are a strict allowlist
+(connect + sign: `eth_requestAccounts`, `personal_sign`, `eth_signTypedData_v4`,
+`eth_sendTransaction`, `wallet_switchEthereumChain` / `wallet_addEthereumChain`;
+plus read-only RPC such as `eth_call` and balance/gas/receipt lookups). Anything
+else is refused with error `4200` without touching the provider. No key
+material crosses the frame, and every signature pops the user's wallet UI for
+explicit approval. The parent only accepts messages from the embed origin with
+`source: 'yeetful-embed'` (a frozen wire identifier) and always posts with an
+explicit `targetOrigin`, never `'*'`.
+
+**One mount, any wallet.** `wallet` is captured at mount, and users pick a
+wallet *after* the chat is on screen. Rather than remount (which drops the
+conversation), hand the SDK a small EIP-1193 facade that forwards `request` to
+whichever wallet is selected and emits `accountsChanged` / `chainChanged`
+itself when the selection changes — the bridge re-announces and the chat
+auto-connects. `setAddress` remains for context-only hosts.
+
+### A complete host app
+
+[agent-examples/agents/robinhood-desk](https://github.com/Pantessa/agent-examples/tree/main/agents/robinhood-desk)
+is a standalone portfolio desk for tokenized stocks on Robinhood Chain: it
+reads holdings and prices from the chain itself, every button is a
+`sendPrompt`, the visitor's wallet signs on the host page through the bridge
+(EIP-6963 discovery + the switching-provider pattern above), the activity log
+is built from the `turn` events, and it ships a Content-Security-Policy and a
+jsdom test of the wire.
+
+If your app has a CSP, `frame-src https://www.pantessa.com` is the only line
+the embed needs. Full contract (URL params, every postMessage payload):
+[pantessa.com/docs/embed](https://www.pantessa.com/docs/embed).
+
+---
+
+## No-code paths
+
+- **Intent links.** Mint a link that carries an ask —
+  `https://www.pantessa.com/i/<slug>` — and share it anywhere. The visitor
+  connects, the same guarded pipeline builds, they sign. Creators earn a share
+  of the fee on every conversion. [pantessa.com/docs/links](https://www.pantessa.com/docs/links)
+- **Host buttons.** A plain `<a>` to an intent link, styled — no script, no
+  iframe. [pantessa.com/docs/host-buttons](https://www.pantessa.com/docs/host-buttons)
+- **Deep links.** `https://www.pantessa.com/chat?mcps=robinhood-free&prompt=Buy%20%2410%20of%20AAPL`
+  lands a visitor in the first-party chat with your MCP set active and the ask
+  prefilled, never auto-sent.
+- **The agent desk.** Give your own agent hands: an MCP door where an agent
+  scans a wallet, plans, and hands the human a link to sign.
+  [pantessa.com/docs/desk](https://www.pantessa.com/docs/desk)
+
+---
+
+## Pay and get paid with x402
+
+[x402](https://www.x402.org) is HTTP `402 Payment Required` done properly: the
+server quotes a price, the client signs a USDC authorization
+([EIP-3009](https://eips.ethereum.org/EIPS/eip-3009)) with a wallet, a
+facilitator settles on-chain, and the request goes through. No accounts, no API
+keys, gasless for the payer. Pantessa's paid MCP tools run on these primitives;
+they are exported so yours can too. `viem` is a peer dependency.
+
+### Gate a route
+
+```ts
+// Next.js App Router
+import { withPayment } from 'pantessa/next'
+
+export const GET = withPayment(
+  { price: '0.01', recipient: '0xYourAddress', network: 'base' },
+  async () => Response.json({ secret: 'gm' }),
+)
+```
+
+```ts
+// Express
+import { paymentRequired } from 'pantessa/express'
+app.get('/premium', paymentRequired({ price: '0.01', recipient: '0xYourAddress', network: 'base' }),
+  (req, res) => res.json({ payer: req.x402?.payer }))
+```
+
+```ts
+// Anywhere else (Hono, Bun, Workers, raw Node): a standard Request in,
+// either a 402 Response or a settle() handle out.
+import { gate } from 'pantessa/server'
+
+const result = await gate(request, { price: '0.01', recipient: '0xYourAddress', network: 'base' })
+if (result.type === 'paymentRequired') return result.response
+const body = Response.json({ secret: 'gm' })
+const { header } = await result.settle()
+body.headers.set('X-PAYMENT-RESPONSE', header)
+return body
+```
+
+Server options: `price` (USD), `recipient`, `network` (`base` · `base-sepolia` ·
+`ethereum` · `optimism` · `arbitrum` · `polygon`, or an array to accept several),
+`asset` (override USDC), `description`, `maxTimeoutSeconds` (600),
+`facilitator` (`{ url, authHeader }`, or `false` to skip settlement in tests —
+the default is the hosted facilitator). If your MCP is claimed on
+pantessa.com, `reportUsage()` from `pantessa/server` is a fire-and-forget
+earn-side receipt that puts each paid call on your dashboard.
+
+### Auto-pay a client
+
+```ts
+import { createPaymentClient } from 'pantessa/client'
+
+const pay = createPaymentClient({
+  wallet,                        // any viem WalletClient
+  maxAmountAtomic: 1_000_000n,   // never pay more than 1 USDC per call
+  allowedNetworks: ['base'],
+  onPaymentRequired: async (req) => true, // return false to cancel
+})
+const res = await pay('https://api.example.com/premium') // use exactly like fetch
+```
+
+### Give an agent an expense account
+
+`pantessa/agent` wraps the client in a grant: an allowlist of hosts plus
+per-call and per-day budgets, enforced **locally and before signing** — the
+guardrail against runaway loops, bugs, and prompt-injected tool calls. Every
+call, paid or refused, emits a receipt.
+
+```ts
+import { pantessa, GrantError } from 'pantessa/agent'
+
+const pay = pantessa({
+  wallet,
+  grant: { allow: ['anthropic.yeetful.com'], perCallUsd: 0.05, perDayUsd: 2, expiresAt: '2026-12-31' },
+  apiKey: process.env.PANTESSA_API_KEY, // optional yf_ key: sync receipts + enforce dashboard budgets
+  onReceipt: (r) => console.log(r.host, `$${r.amountUsd}`, r.txHash ?? r.note),
+})
+
+try {
+  const res = await pay('https://anthropic.yeetful.com/mcp')
+} catch (e) {
+  if (e instanceof GrantError) console.error(e.code)
+  // NOT_ALLOWED | OVER_PER_CALL | BUDGET_EXCEEDED | EXPIRED | REVOKED
+  // | OVER_AGENT_BUDGET | OVER_ORG_BUDGET | AGENT_PAUSED | ACCOUNT_FROZEN
+}
+```
+
+With an `apiKey`, the SDK also mirrors what the dashboard says: the key's own
+daily budget, the organization's budget above it, and the remote kill switch —
+a paused agent or frozen account halts all payments until unfrozen.
+`pay.agentBudget()`, `pay.orgBudget()`, `pay.status()`,
+`pay.spentTodayUsd()`, `pay.remainingTodayUsd()` and `pay.flushLedger()`
+(call it before a short-lived script exits) expose the state. Sync is
+best-effort and never blocks a payment; `ledgerUrl` must be the canonical
+origin (`https://www.pantessa.com`), because `fetch` drops `Authorization`
+across a cross-origin redirect. This enforcement is in-process — right for
+governing your own agents; for adversarial guarantees back the grant with an
+on-chain Spend Permission. Policy details:
+[pantessa.com/docs/spend-policy](https://www.pantessa.com/docs/spend-policy).
 
 ---
 
 ## API reference
 
+### `pantessa/embed`
+
+- `mountPantessaChat(options)` — mounts the chat iframe (inline or bubble) and returns a `PantessaChatHandle`: `sendPrompt` · `setAddress` · `setTheme` · `open` · `close` · `destroy` · `iframe`. Browser-only, zero deps.
+- `DEFAULT_EMBED_ORIGIN`, `FIRST_PARTY_EMBED_ORIGINS` — the hosted origin and the closed set of first-party origins the parent accepts (the pre-rename origin redirects; the check survives it).
+- Types: `PantessaChatOptions`, `PantessaChatHandle`, `Eip1193Provider`. Deprecated aliases: `mountYeetfulChat`, `YeetfulChatOptions`, `YeetfulChatHandle`.
+
 ### `pantessa/server`
 
 - `gate(request, options)` — runtime-agnostic. Returns `{ type: 'paymentRequired', response }` or `{ type: 'ok', payer, settle }`.
-- `reportUsage(options)` — fire-and-forget earn-side receipt to your Pantessa dashboard. Never throws; resolves `true` on a 2xx.
-- `Facilitator` — thin wrapper around verify/settle HTTP endpoints.
-- `DEFAULT_FACILITATOR_URL` — the hosted facilitator URL.
-- `DEFAULT_RECEIPTS_URL` — the hosted earn-side ingestion URL.
+- `reportUsage(options)` — fire-and-forget earn-side receipt. Never throws; resolves `true` on a 2xx.
+- `Facilitator`, `DEFAULT_FACILITATOR_URL`, `DEFAULT_RECEIPTS_URL`.
 
-### `pantessa/next`
+### `pantessa/next` · `pantessa/express`
 
 - `withPayment(options, handler)` — wraps a Next.js route handler.
-
-### `pantessa/express`
-
-- `paymentRequired(options)` — returns an Express `RequestHandler`. Sets `req.x402.payer` after successful verification.
+- `paymentRequired(options)` — Express middleware; sets `req.x402.payer` after verification.
 
 ### `pantessa/client`
 
-- `createPaymentClient(options)` — returns a `fetch`-compatible function that handles 402s automatically.
+- `createPaymentClient(options)` — a `fetch`-compatible function that handles 402s.
 - `signPayment(wallet, requirement)` — sign a payment payload by hand.
 - `PaymentError` — thrown when the client declines to pay.
 
-### `pantessa/embed`
+### `pantessa/agent`
 
-- `mountPantessaChat(options)` — mounts the Pantessa chat iframe (inline or bubble); returns a `PantessaChatHandle` (`setAddress` / `setTheme` / `sendPrompt` / `open` / `close` / `destroy`). Browser-only, zero deps. `options.wallet: 'auto' | Eip1193Provider | false` (default `'auto'`) bridges the host page's wallet provider into the chat — allowlisted EIP-1193 methods are relayed over `postMessage`; signatures/txs always pop the user's own wallet UI.
+- `pantessa(options)` (alias `yeetful`) — the grant-aware paid `fetch` with `spentTodayUsd` / `remainingTodayUsd` / `agentBudget` / `orgBudget` / `status` / `flushLedger`.
+- `GrantError` — `.code` is one of the violation codes above.
+- `DEFAULT_LEDGER_URL`.
 
-### Helpers
+### Helpers (top-level)
 
-- `usdcAddress(network)` — canonical USDC contract for a supported network.
-- `usdToAtomic(amount, decimals?)` — safe USD → atomic-units conversion.
-- `encodePayment` / `decodePayment` — base64 JSON codec for headers.
+- `usdcAddress(network)` · `usdToAtomic(amount, decimals?)` · `USDC_DECIMALS` · `encodePayment` / `decodePayment`.
 
 ---
 
@@ -507,19 +345,13 @@ with an explicit `targetOrigin` (never `'*'`).
 
 ```bash
 npm install
-npm run build     # bundles ESM + CJS + d.ts via tsup
+npm run build     # ESM + CJS + d.ts via tsup
 npm run typecheck
 npm test
 ```
 
-To publish:
-
-```bash
-npm run build
-npm publish
-```
-
----
+Every PR that changes shipped code bumps `version` in `package.json` (and the
+CHANGELOG) in the same PR. Releases are `npm run build && npm publish`.
 
 ## License
 
