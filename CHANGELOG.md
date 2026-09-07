@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.1
+
+Two embed fixes found by building a complete host app against 1.0.0
+([agent-examples/agents/robinhood-desk](https://github.com/Pantessa/agent-examples/tree/main/agents/robinhood-desk)):
+
+- **Inline embeds no longer get pinned to a px height.** The hosted chat fills
+  its viewport, so the `resize` it reports normally equals the iframe's
+  current height; `mountPantessaChat` wrote that back as an inline
+  `height: NNNpx` on every host whose container was sized by a stylesheet
+  (no inline style), turning the `100%` iframe into a fixed one that stopped
+  following the container on resize. Resize now applies only when the chat
+  asks for a genuinely different height.
+- **Fullscreen is delegated into the frame** (`allow="… fullscreen"` +
+  `allowfullscreen`), so the chat's own fullscreen button works from a
+  cross-origin host instead of failing silently.
+- `repository.url` points at the `Pantessa` GitHub org (the `Yeetful` org was
+  renamed).
+- README: the `onEvent` stream (`turn` / `order-signed`) is documented, and
+  the recommended pattern for hosts whose users pick a wallet after mount.
+
 ## 1.0.0 — renamed to `pantessa`
 
 **BREAKING (package name only).** Yeetful is now Pantessa, and the package

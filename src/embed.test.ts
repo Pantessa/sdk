@@ -503,3 +503,28 @@ describe('mountPantessaChat', () => {
     expect((hb.iframe.parentElement as HTMLElement).style.visibility).toBe('hidden')
   })
 })
+
+describe('1.0.1 — host-page findings from the robinhood-desk example', () => {
+  it('delegates fullscreen into the frame so the chat’s own fullscreen button works', () => {
+    const h = mount({ container: makeContainer() })
+    expect(h.iframe.getAttribute('allow')).toContain('fullscreen')
+    expect(h.iframe.allowFullscreen).toBe(true)
+    // and nothing wallet-shaped is delegated — signatures happen on the host page
+    expect(h.iframe.getAttribute('allow')).not.toMatch(/ethereum|wallet/i)
+  })
+
+  it('does not pin a CSS-sized inline iframe to px when the chat reports its current height', () => {
+    const container = makeContainer()
+    const h = mount({ container })
+    // The host sized the container with a stylesheet (no inline style) and the
+    // iframe is filling it at 640px; the chat (h-dvh) reports exactly that.
+    Object.defineProperty(h.iframe, 'getBoundingClientRect', {
+      value: () => ({ height: 640, width: 400, top: 0, left: 0, right: 400, bottom: 640, x: 0, y: 0, toJSON() {} }),
+    })
+    dispatch(ORIGIN, { source: 'yeetful-embed', v: 1, type: 'resize', height: 640 })
+    expect(h.iframe.style.height).toBe('100%')
+    // A genuinely different height still applies (content grew past the frame).
+    dispatch(ORIGIN, { source: 'yeetful-embed', v: 1, type: 'resize', height: 900 })
+    expect(h.iframe.style.height).toBe('900px')
+  })
+})
