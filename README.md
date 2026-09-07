@@ -411,7 +411,7 @@ wagmi) or `false` to turn the bridge off. `setAddress` remains for
 context-only hosts that just want to tell the chat which address to talk
 about without wiring a wallet.
 
-React (e.g. a CoW Swap fork), mounting in a `useEffect` and syncing the
+React (your own trading UI), mounting in a `useEffect` and syncing the
 connected account:
 
 ```tsx
@@ -439,6 +439,22 @@ function PantessaChat({ address }: { address?: string }) {
   return <div ref={ref} style={{ height: 560 }} />
 }
 ```
+
+Users usually pick a wallet *after* the chat is on screen, and `wallet` is
+captured at mount. Hand the SDK a provider that survives that — a small
+EIP-1193 facade that forwards `request` to whichever wallet is selected and
+emits `accountsChanged` / `chainChanged` itself when the selection changes —
+rather than remounting (a remount drops the conversation). The
+[robinhood-desk example](https://github.com/Pantessa/agent-examples/tree/main/agents/robinhood-desk)
+does exactly this (EIP-6963 discovery included) and is a complete host app:
+holdings read from the chain, every button a `sendPrompt`, an activity log
+built from the `onEvent` stream, a real CSP, and a jsdom test of the wire.
+
+`onEvent(name, data)` receives `turn` once per chat turn —
+`{ outcome, artifact?, valueUsd?, txUrl?, chainId? }`, outcomes `answered ·
+tx-built · signed · settled · clarify · refused · credit-gate · error` — and
+`order-signed` when a CoW / Hyperliquid order signs. Enough for a host-side
+funnel without touching the chat's internals.
 
 `mountPantessaChat(options)` returns a handle: `{ iframe, setAddress, setTheme,
 sendPrompt, open, close, destroy }`. `open`/`close` drive the bubble panel

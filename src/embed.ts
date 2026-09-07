@@ -222,7 +222,13 @@ export function mountPantessaChat(opts: PantessaChatOptions = {}): PantessaChatH
   const iframe = document.createElement('iframe')
   iframe.src = url.toString()
   iframe.title = 'Pantessa chat'
-  iframe.setAttribute('allow', 'clipboard-write; payment')
+  // `fullscreen` lets the chat's own fullscreen button work from inside a
+  // cross-origin frame (without it the browser refuses silently and the
+  // button hides itself); the rest are what a chat with receipts + payments
+  // needs. Wallet prompts happen on the HOST page (the bridge), so no
+  // wallet-shaped permissions are delegated into the frame.
+  iframe.setAttribute('allow', 'clipboard-write; payment; fullscreen')
+  iframe.allowFullscreen = true
   iframe.style.border = '0'
   iframe.style.display = 'block'
 
@@ -425,8 +431,20 @@ export function mountPantessaChat(opts: PantessaChatOptions = {}): PantessaChatH
     } else if (data.type === 'rpc') {
       handleRpc(data)
     } else if (data.type === 'resize') {
-      // Inline only, and only when the host hasn't sized the container itself.
-      if (mode === 'inline' && container && container.style.height === '' && typeof data.height === 'number') {
+      // Inline only, only when the host hasn't sized the container itself
+      // (inline style), and only when the chat genuinely wants a DIFFERENT
+      // height. The hosted chat fills its viewport (h-dvh), so its reported
+      // height normally EQUALS the iframe's current height — writing that
+      // back would turn the `100%` iframe into a fixed px height and stop it
+      // following a CSS-sized container on resize (found on a host whose
+      // container was sized by a stylesheet, not an inline style).
+      if (
+        mode === 'inline' &&
+        container &&
+        container.style.height === '' &&
+        typeof data.height === 'number' &&
+        Math.round(data.height) !== Math.round(iframe.getBoundingClientRect().height)
+      ) {
         iframe.style.height = `${data.height}px`
       }
     } else if (data.type === 'event') {
