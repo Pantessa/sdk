@@ -224,10 +224,13 @@ export function mountPantessaChat(opts: PantessaChatOptions = {}): PantessaChatH
   iframe.title = 'Pantessa chat'
   // `fullscreen` lets the chat's own fullscreen button work from inside a
   // cross-origin frame (without it the browser refuses silently and the
-  // button hides itself); the rest are what a chat with receipts + payments
-  // needs. Wallet prompts happen on the HOST page (the bridge), so no
-  // wallet-shaped permissions are delegated into the frame.
-  iframe.setAttribute('allow', 'clipboard-write; payment; fullscreen')
+  // button hides itself); `microphone` lets the composer's voice button
+  // listen (the chat's own speech recognizer — a cross-origin frame without
+  // the delegation gets a silent permission refusal); the rest are what a
+  // chat with receipts + payments needs. Wallet prompts happen on the HOST
+  // page (the bridge), so no wallet-shaped permissions are delegated into
+  // the frame.
+  iframe.setAttribute('allow', 'clipboard-write; payment; fullscreen; microphone')
   iframe.allowFullscreen = true
   iframe.style.border = '0'
   iframe.style.display = 'block'
