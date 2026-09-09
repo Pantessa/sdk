@@ -509,6 +509,8 @@ describe('1.0.1 — host-page findings from the robinhood-desk example', () => {
     const h = mount({ container: makeContainer() })
     expect(h.iframe.getAttribute('allow')).toContain('fullscreen')
     expect(h.iframe.allowFullscreen).toBe(true)
+    // The composer's voice button needs the mic delegated into the frame.
+    expect(h.iframe.getAttribute('allow')).toContain('microphone')
     // and nothing wallet-shaped is delegated — signatures happen on the host page
     expect(h.iframe.getAttribute('allow')).not.toMatch(/ethereum|wallet/i)
   })

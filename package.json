@@ -1,6 +1,6 @@
 {
   "name": "pantessa",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Spend-controlled x402 for AI agents. Give an agent an expense account — an allowlist + per-call/per-day budget — and pay any x402 endpoint in a few lines. Plus drop-in x402 client/server helpers and the embeddable Pantessa chat.",
   "keywords": [
     "x402",

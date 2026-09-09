@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.2
+
+- **The microphone is delegated into the frame** (`allow="… microphone"`).
+  The hosted chat's composer now carries a voice button (speak "show me the
+  ETH chart" or "buy ten dollars of ETH" and it runs as a typed ask would —
+  the wallet signature is still the only gate). A cross-origin iframe
+  without the delegation gets a silent permission refusal, so installs on
+  1.0.1 and earlier show the mic as blocked; upgrade to enable it.
+
 ## 1.0.1
 
 Two embed fixes found by building a complete host app against 1.0.0
