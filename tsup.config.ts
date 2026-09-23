@@ -9,6 +9,7 @@ export default defineConfig({
     next: 'src/next.ts',
     express: 'src/express.ts',
     embed: 'src/embed.ts',
+    desk: 'src/desk.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

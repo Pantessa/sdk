@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.0
+
+- **New entry point `pantessa/desk` — hand it a signer and it gets done.**
+  Pantessa's agent desk already compiled an agent's sequenced ask into a
+  guarded multi-leg job the agent's own wallet drives off the Jobs API; until
+  now every caller had to reimplement four artifact shapes, a server-side
+  re-quote recipe, the Hyperliquid relay and a settlement poll by hand. The
+  loop is one call now:
+  - `driveJob({ base, jobId, token, signer, … })` — polls the job and signs
+    whatever the runner offers: a single transaction, a transaction chain
+    (re-quoting any step carrying a `refresh` recipe right before it is
+    signed), a Hyperliquid L1 action (with its one-time builder-fee cap and
+    leverage pre-step), or a batch of them in order. Waits for a **successful**
+    receipt before completing, and never posts a completion for a reverted
+    transaction. Stops at `done` / `failed` / `canceled`.
+  - `openAndExecute({ base, ask, signer, agentKey, … })` — `broker_open` →
+    option → consent `personal_sign` → `broker_execute`, returning the
+    `{ jobId, token }` that go straight into `driveJob`.
+  - `dryRun: true` classifies every leg and returns before the first
+    broadcast; a leg the guard withheld comes back with its own sentence.
+  - Typed `DeskError`s throughout — a raw `fetch` error never escapes — and a
+    leg shape the SDK will not guess at fails closed rather than signing.
+  - `DEFAULT_RPC` holds each chain's own public endpoint and deliberately never
+    publicnode (whose free tier refuses `eth_getTransactionReceipt`); pass
+    `rpc` to use your own provider.
+
+  Additive: nothing existing changed, and the desk MCP surface is untouched.
+
 ## 1.0.2
 
 - **The microphone is delegated into the frame** (`allow="… microphone"`).
