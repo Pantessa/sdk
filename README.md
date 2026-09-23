@@ -373,6 +373,118 @@ x402 is a natural fit for agent tooling — drop `withPayment` in front of any M
 
 ---
 
+## Drive a job with your own signer
+
+`pantessa/desk` is the other half of the agent story: not "pay for a call", but
+**"hand me a signer and it gets done."**
+
+Pantessa's [agent desk](https://www.pantessa.com/docs/desk) compiles a plain
+sentence into a guarded, multi-leg **job** owned by the wallet that will sign
+it. Deterministic builders write every transaction — no model writes calldata —
+each leg is guard-checked fail-closed and spend-policy gated at build *and* at
+submit, and the wait legs between them verify arrival on-chain before the next
+leg is built. **Round-trip across every settlement boundary, batched within
+one.** Pantessa never holds your key.
+
+```ts
+import { openAndExecute, driveJob } from 'pantessa/desk'
+import { privateKeyToAccount } from 'viem/accounts'
+
+const signer = privateKeyToAccount(process.env.AGENT_KEY as `0x${string}`)
+const base = 'https://www.pantessa.com'
+
+// 1. Open an intent, take a funding route if the wallet is short, consent.
+const { jobId, token, steps } = await openAndExecute({
+  base,
+  ask: 'Fund Hyperliquid with $15 from Base, then 2x long $12 of HYPE',
+  signer,
+  agentKey: process.env.DESK_KEY!,   // your desk identity
+  agent: 'my-agent',                 // the byline on your track record
+})
+
+// 2. Drive it. One call signs every leg the runner offers, in order.
+const out = await driveJob({
+  base, jobId, token, signer,
+  rpc: { 8453: process.env.BASE_RPC! },        // your provider (recommended)
+  onLeg: (leg) => console.log(`leg ${leg.seq} · ${leg.kind} · ${leg.summary}`),
+  onDone: (seq, r) => console.log(`  ✓ ${r.txHash ?? r.detail}`),
+})
+console.log(out.status) // 'done' | 'failed' | 'canceled'
+```
+
+**Try it without signing anything.** `dryRun: true` classifies each leg and
+returns before the first broadcast — and if the wallet can't fund a leg, it
+comes back with the guard's own sentence instead of spinning:
+
+```ts
+const dry = await driveJob({ base, jobId, token, signer, dryRun: true })
+dry.legs      // [{ seq: 0, kind: 'txChain', chainId: 8453, summary: 'Swap 1 USDC → ~0.000366 ETH …' }]
+dry.withheld  // { seq: 0, reason: 'Nothing to sign yet: this would spend 1 USDC on Base and the wallet holds 0 …' }
+```
+
+### What a leg can be
+
+`driveJob` handles every shape the runner offers, so you don't have to:
+
+| `leg.kind` | What it is | What the loop does |
+| --- | --- | --- |
+| `tx` | one EVM transaction | sign → broadcast → wait for a **successful** receipt → complete with the hash |
+| `txChain` | N transactions in order (approve → swap) | runs them in order, re-quoting any step that carries a `refresh` recipe right before it is signed; completes with the last hash |
+| `hlAction` | a Hyperliquid L1 action | signs the typed data **verbatim** and submits it through the relay (a one-time builder-fee cap and a leverage pre-step are signed first when the build carries them) |
+| `hlBatch` | several L1 actions inside one settlement boundary | signs **every member in one pass**, then submits them in order; a member that fails stops the batch and its partial result is still posted, so the runner re-offers from exactly there |
+| `order` | a non-Hyperliquid EIP-712 order (CoW, Seaport) | **refused by name** — it has its own submit endpoint and prerequisites, so this loop will not guess at it |
+| `wait` | a settlement wait | left to the runner, which verifies arrival on-chain; the loop polls |
+
+Anything else fails **closed** with a named `DeskError` rather than guessing at
+a signature. Every failure this module raises is a `DeskError` with a `code`
+(`http`, `desk-refused`, `unsupported-leg`, `no-rpc`, `broadcast`, `withheld`,
+`stale`, `max-legs`, …) — a raw `fetch` error never escapes.
+
+### Notes that matter
+
+- **Bring your own RPC.** `DEFAULT_RPC` holds each chain's own public endpoint
+  as a convenience, deliberately never publicnode (its free tier refuses
+  `eth_getTransactionReceipt`, and this loop polls receipts). Pass `rpc` in
+  production; Robinhood Chain's public RPC rate-limits per IP.
+- **A Hyperliquid nonce stays signable for 90 seconds** (`HL_NONCE_LIFE_MS`),
+  and a batch shares the clock of its earliest member. A build whose window has
+  lapsed is **rebuilt, never re-signed**: the loop asks the runner for a fresh
+  one (`POST /api/jobs/{id}/retry`) and picks the new build up on the next poll.
+- **Completion is advancement, not proof.** The runner re-verifies on-chain, so
+  a result the chain disagrees with fails the job closed one leg later. The
+  loop never posts a completion for a reverted transaction.
+- `openAndExecute` needs a **sequenced** ask (fund → wait → act). A single-step
+  ask is refused by name — use the sign-link path (`broker_handoff`) for those.
+- **Cadence follows the wire.** Left alone, the loop polls every
+  `BUILD_RETRY_MS` while a leg builds and every `SETTLE_RETRY_MS` while one
+  settles; pass `pollMs` to force your own. `headers` are stamped on every call
+  it makes (the Jobs API, the re-quote route, the relay) — that is where a
+  drill puts `x-yf-internal-run`.
+- The consent `openAndExecute` signs is a plain `personal_sign` over one
+  readable sentence, carrying an `Issued at:` line the desk checks both ways
+  (ten minutes). It costs no gas and moves nothing by itself; every leg still
+  needs this wallet's own signature. The text is **byte-exact** with the
+  desk's own — it rebuilds the text from the `issued_at` you send and recovers
+  the signer from it, so there is deliberately **no fallback spelling**: drift
+  fails loudly rather than costing a silent extra signature.
+- **`agentKey` is required.** The agent-signed path has no human in the loop,
+  so `broker_execute` takes the same desk identity `broker_open` was given and
+  compares it timing-safe.
+- **Completions carry only the nine keys the runner names**
+  (`DESK_LEG_RESULT_KEYS`, the same list in the same order as the desk's own)
+  and a lowercase 64-hex hash; an oversized venue response is dropped rather
+  than breaching the runner's 8 KiB cap. The runner refuses an unnamed key
+  rather than reshaping it. A Hyperliquid leg reports the venue's own `status`
+  and `fill` under their own keys, not buried in `orderResponse`; a `txChain`
+  leg reports every hash with the runner's own per-transaction label.
+- **The types are a mirror.** `DeskLegKind`, `DeskLegView`, `DeskLegResult`,
+  `DeskNext`, `legViewOf` and `deskNextOf` are line-for-line copies of
+  `lib/desk-wire.ts` in the Pantessa app, and the app's harness pins the two in
+  sync — so what this SDK calls a leg is exactly what the desk calls one.
+
+
+---
+
 ## Embed the chat
 
 `pantessa/embed` drops the Pantessa chat into any webpage as an iframe — zero
@@ -494,6 +606,17 @@ with an explicit `targetOrigin` (never `'*'`).
 ### `pantessa/embed`
 
 - `mountPantessaChat(options)` — mounts the Pantessa chat iframe (inline or bubble); returns a `PantessaChatHandle` (`setAddress` / `setTheme` / `sendPrompt` / `open` / `close` / `destroy`). Browser-only, zero deps. `options.wallet: 'auto' | Eip1193Provider | false` (default `'auto'`) bridges the host page's wallet provider into the chat — allowlisted EIP-1193 methods are relayed over `postMessage`; signatures/txs always pop the user's own wallet UI.
+
+### `pantessa/desk`
+
+- `driveJob(options)` — poll a Pantessa job and sign every leg it offers with your own signer (`tx` / `txChain` incl. re-quotes / `hlAction` / `hlBatch`), completing each one; resolves when the job is `done` / `failed` / `canceled`. `dryRun: true` classifies and stops before the first broadcast.
+- `openAndExecute(options)` — `broker_open` → pick an option (default: the first funding route when the wallet is short, else proceed) → consent `personal_sign` → `broker_execute`; returns `{ intentId, jobId, token, steps }`.
+- `deskCall(base, tool, args)` — call one desk MCP tool over plain JSON-RPC (the desk is stateless Streamable HTTP: no `initialize`, no session header).
+- `legViewOf(step)` / `deskNextOf(job)` — the mirror of the app's `lib/desk-wire.ts`: classify a raw Jobs-API step into a `DeskLegView`, or answer "what should I do right now" for a whole job.
+- `HL_DOMAIN_CHAIN_ID`, `HL_NONCE_LIFE_MS`, `LEG_OFFER_TTL_MS`, `BUILD_RETRY_MS`, `SETTLE_RETRY_MS` — the wire's own constants, by name.
+- `deskExecuteConsentMessage(intentId, wallet)` — the exact consent bytes the desk recovers.
+- `firstFundableOption(options, plan)` — the default option picker.
+- `DeskError` / `DEFAULT_RPC`.
 
 ### Helpers
 

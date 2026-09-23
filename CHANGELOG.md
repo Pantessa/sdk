@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.1.0
+
+- **New entry point `pantessa/desk` — hand it a signer and it gets done.**
+  Pantessa's agent desk already compiled an agent's sequenced ask into a
+  guarded multi-leg job the agent's own wallet drives off the Jobs API; until
+  now every caller had to reimplement four artifact shapes, a server-side
+  re-quote recipe, the Hyperliquid relay and a settlement poll by hand. The
+  loop is one call now:
+  - `driveJob({ base, jobId, token, signer, … })` — polls the job and signs
+    whatever the runner offers: a single transaction, a transaction chain
+    (re-quoting any step carrying a `refresh` recipe right before it is
+    signed), a Hyperliquid L1 action (with its one-time builder-fee cap and
+    leverage pre-step), or a batch of them in order. Waits for a **successful**
+    receipt before completing, and never posts a completion for a reverted
+    transaction. Stops at `done` / `failed` / `canceled`.
+  - `openAndExecute({ base, ask, signer, agentKey, … })` — `broker_open` →
+    option → consent `personal_sign` → `broker_execute`, returning the
+    `{ jobId, token }` that go straight into `driveJob`.
+  - `dryRun: true` classifies every leg and returns before the first
+    broadcast; a leg the guard withheld comes back with its own sentence.
+  - Typed `DeskError`s throughout — a raw `fetch` error never escapes — and a
+    leg shape the SDK will not guess at fails closed rather than signing. A
+    non-Hyperliquid order (CoW, Seaport) is refused by name.
+  - `DeskLegKind`, `DeskLegView`, `DeskLegResult`, `DeskNext`, `legViewOf` and
+    `deskNextOf` mirror the app's `lib/desk-wire.ts` line for line, constants
+    included (`HL_NONCE_LIFE_MS`, `LEG_OFFER_TTL_MS`, `BUILD_RETRY_MS`,
+    `SETTLE_RETRY_MS`); the app's harness pins the two in sync.
+  - A Hyperliquid batch is read from `orderRequest.batch`, signed in ONE pass
+    and submitted member by member in order; a failure stops the batch and its
+    partial result is still posted, so the runner re-offers from exactly there.
+    A leg whose nonce window has lapsed is rebuilt (`POST /api/jobs/{id}/retry`),
+    never re-signed.
+  - The execute consent is **byte-exact** with the desk's own five-line text,
+    carrying an `Issued at:` line checked both ways inside ten minutes, and
+    `broker_execute` takes `issued_at` + the required `agent_key`. No fallback
+    spelling: the desk rebuilds the text from the caller's own string, so drift
+    must fail loudly rather than cost a silent second signature.
+  - Completions carry only the keys the runner names (`DESK_LEG_RESULT_KEYS` —
+    the same nine, in the same order, as the desk's own list), with a lowercase
+    64-hex hash; an oversized venue response is dropped rather than breaching
+    the 8 KiB cap. A Hyperliquid leg reports the venue's `status` and `fill`
+    under their own keys; a `txChain` leg reports every hash with the runner's
+    own per-transaction label (`txs[].title`).
+  - `headers` are stamped on every call the loop makes, and `pollMs` overrides
+    a cadence that otherwise follows the wire's own `BUILD_RETRY_MS` /
+    `SETTLE_RETRY_MS`.
+  - `DEFAULT_RPC` holds each chain's own public endpoint and deliberately never
+    publicnode (whose free tier refuses `eth_getTransactionReceipt`); pass
+    `rpc` to use your own provider.
+
+  Additive: nothing existing changed, and the desk MCP surface is untouched.
+
 ## 1.0.2
 
 - **The microphone is delegated into the frame** (`allow="… microphone"`).

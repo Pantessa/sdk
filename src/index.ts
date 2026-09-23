@@ -14,6 +14,7 @@
  *   - `pantessa/next`    → Next.js App Router `withPayment()`
  *   - `pantessa/express` → Express `paymentRequired()` middleware
  *   - `pantessa/embed`   → browser-only `mountPantessaChat()` chat-iframe helper
+ *   - `pantessa/desk`    → `driveJob()` / `openAndExecute()` — sign a guarded job with your own key
  */
 
 export { pantessa, yeetful, DEFAULT_LEDGER_URL, GrantError } from './agent.js'
@@ -55,3 +56,19 @@ export type {
   X402Scheme,
   ExactEvmPayload,
 } from './types.js'
+
+export { driveJob, openAndExecute, deskCall, deskExecuteConsentMessage, firstFundableOption, legViewOfStep, DeskError, DEFAULT_RPC } from './desk.js'
+export type {
+  DeskErrorCode,
+  DeskLegKind,
+  DeskLegResult,
+  DeskLegView,
+  DeskOption,
+  DeskSigner,
+  DriveJobOptions,
+  DriveJobOutcome,
+  JobStep,
+  JobView,
+  OpenAndExecuteOptions,
+  OpenAndExecuteResult,
+} from './desk.js'
