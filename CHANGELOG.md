@@ -37,9 +37,11 @@
     `broker_execute` takes `issued_at` + the required `agent_key`. No fallback
     spelling: the desk rebuilds the text from the caller's own string, so drift
     must fail loudly rather than cost a silent second signature.
-  - Completions carry only the keys the runner names (`LEG_RESULT_KEYS`), with
-    a lowercase 64-hex hash; an oversized venue response is dropped rather than
-    breaching the 8 KiB cap.
+  - Completions carry only the keys the runner names (`DESK_LEG_RESULT_KEYS` —
+    the same nine, in the same order, as the desk's own list), with a lowercase
+    64-hex hash; an oversized venue response is dropped rather than breaching
+    the 8 KiB cap. A Hyperliquid leg reports the venue's `status` and `fill`
+    under their own keys.
   - `headers` are stamped on every call the loop makes, and `pollMs` overrides
     a cadence that otherwise follows the wire's own `BUILD_RETRY_MS` /
     `SETTLE_RETRY_MS`.

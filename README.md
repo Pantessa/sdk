@@ -470,10 +470,12 @@ a signature. Every failure this module raises is a `DeskError` with a `code`
 - **`agentKey` is required.** The agent-signed path has no human in the loop,
   so `broker_execute` takes the same desk identity `broker_open` was given and
   compares it timing-safe.
-- **Completions carry only the nine keys the runner names** (`LEG_RESULT_KEYS`)
+- **Completions carry only the nine keys the runner names**
+  (`DESK_LEG_RESULT_KEYS`, the same list in the same order as the desk's own)
   and a lowercase 64-hex hash; an oversized venue response is dropped rather
   than breaching the runner's 8 KiB cap. The runner refuses an unnamed key
-  rather than reshaping it.
+  rather than reshaping it. A Hyperliquid leg reports the venue's own `status`
+  and `fill` under their own keys, not buried in `orderResponse`.
 - **The types are a mirror.** `DeskLegKind`, `DeskLegView`, `DeskLegResult`,
   `DeskNext`, `legViewOf` and `deskNextOf` are line-for-line copies of
   `lib/desk-wire.ts` in the Pantessa app, and the app's harness pins the two in

@@ -90,19 +90,34 @@ export interface DeskLegView {
   staleAfterMs: number | null
 }
 
+/**
+ * What a signer reports back for one leg. THE list — mirrors `DeskLegResult`
+ * in the app's `lib/desk-wire.ts`, field for field and in the same order, and
+ * the desk's allowlist derives from that type rather than re-typing it.
+ *
+ * Everything here is the signer's CLAIM about its own signature. The runner
+ * treats it as advancement; the wait leg after it, and the receipt check on
+ * the money row, are what make it true.
+ */
 export interface DeskLegResult {
+  /** EVM: the hash — of the LAST transaction for a txChain. Lowercase. */
   txHash?: Hex
   chainId?: number
-  /** Hyperliquid: the venue's response to the submitted action(s). */
+  /** EVM: every hash the leg produced, when the leg was more than one tx. */
+  txs?: Array<{ hash: string; chainId: number }>
+  /** Hyperliquid / CoW / Seaport: the venue's response to the submitted action. */
   orderResponse?: unknown
+  /** Hyperliquid: the fill, when the venue returned one separately. */
+  fill?: unknown
   /** hlBatch: one entry per SUBMITTED member, in order; a failed member is the
    *  last entry with `ok: false` and the runner re-offers from it. */
   batch?: Array<{ ok: boolean; orderResponse?: unknown; error?: string }>
-  /** Every confirmed hash of a txChain leg, in order. */
-  txs?: Array<{ hash: Hex; chainId: number; title: string }>
-  /** A human line the job card and the desk log show verbatim. */
+  /** A human line for the card and the desk log, when a hash says nothing. */
   detail?: string
+  /** The venue's own link for an off-chain order (no EVM explorer exists). */
   explorerUrl?: string
+  /** The venue's own word for what happened, when it has one. */
+  status?: string
 }
 
 export interface DeskNext {
@@ -630,10 +645,25 @@ export interface DriveJobOutcome {
 
 const ACTIVE = new Set(['running', 'waiting_signature', 'waiting_settlement', 'paused'])
 
-/** The only keys a leg's completion may carry (mirrors `LEG_RESULT_KEYS` in
- *  the app's `lib/job-step-money.ts`). The runner REFUSES an unnamed key
- *  rather than reshaping it, so this loop never invents one. */
-export const LEG_RESULT_KEYS = ['txHash', 'txs', 'chainId', 'orderResponse', 'batch', 'fill', 'detail', 'explorerUrl', 'status'] as const
+/** {@link DeskLegResult}'s keys, as data — the same list, in the same order,
+ *  as `DESK_LEG_RESULT_KEYS` in the app's `lib/desk-wire.ts`. The runner
+ *  allowlists exactly these and REFUSES anything else rather than reshaping
+ *  it, so this loop never invents a key. */
+export const DESK_LEG_RESULT_KEYS = [
+  'txHash',
+  'chainId',
+  'txs',
+  'orderResponse',
+  'fill',
+  'batch',
+  'detail',
+  'explorerUrl',
+  'status',
+] as const satisfies ReadonlyArray<keyof DeskLegResult>
+
+/** @deprecated use {@link DESK_LEG_RESULT_KEYS}. */
+export const LEG_RESULT_KEYS = DESK_LEG_RESULT_KEYS
+
 /** The runner's cap on a serialized completion body. */
 export const LEG_RESULT_MAX_BYTES = 8 * 1024
 
@@ -647,7 +677,7 @@ function lowerHash(h: string): Hex {
  *  the receipt is the hash and the runner re-verifies on-chain anyway. */
 function fitLegResult(result: DeskLegResult): DeskLegResult {
   const named = Object.fromEntries(
-    Object.entries(result).filter(([k, v]) => v !== undefined && (LEG_RESULT_KEYS as readonly string[]).includes(k)),
+    Object.entries(result).filter(([k, v]) => v !== undefined && (DESK_LEG_RESULT_KEYS as readonly string[]).includes(k)),
   ) as DeskLegResult
   const size = (r: DeskLegResult) => {
     try {
@@ -898,7 +928,7 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
       const chain = obj(a.txChain)!
       let steps = (chain.steps as Array<Record<string, unknown>>).slice()
       const recipe = obj(chain.refresh) as { kind: string; stepIndex: number; params: Record<string, string> } | null
-      const txs: Array<{ hash: Hex; chainId: number; title: string }> = []
+      const txs: Array<{ hash: string; chainId: number }> = []
       for (let i = 0; i < steps.length; i++) {
         let step = steps[i]! as unknown as { title?: string; tx: LegTx & { chainId?: number }; validUntil?: number }
         // A step with a recipe is rebuilt right before it is offered: prices
@@ -912,11 +942,11 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
         const chainId = step.tx.chainId ?? leg.chainId
         if (!chainId) throw new DeskError('unsupported-leg', `Leg ${leg.seq} step ${i} names no chain.`)
         const hash = await send(step.tx, chainId)
-        txs.push({ hash, chainId, title: String(step.title ?? `step ${i + 1}`) })
+        txs.push({ hash, chainId })
       }
       const last = txs[txs.length - 1]
       if (!last) throw new DeskError('unsupported-leg', `Leg ${leg.seq} carries an empty transaction chain.`)
-      return { txHash: last.hash, chainId: last.chainId, txs, detail: leg.summary }
+      return { txHash: lowerHash(last.hash), chainId: last.chainId, txs, detail: leg.summary }
     }
 
     if (leg.kind === 'hlAction' || leg.kind === 'hlBatch') {
@@ -999,22 +1029,25 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
         ? `${String(expected.kind ?? 'order')} ${String(expected.coin ?? '')} filled ${String(filled.totalSz)} @ ${String(filled.avgPx)}`
         : `${String(expected.kind ?? 'order')} ${String(expected.coin ?? '')}`
 
+      // The venue's own word and its fill, reported under the keys the wire
+      // names for them rather than buried inside `orderResponse`.
+      const venue = {
+        fill: filled ?? undefined,
+        status: typeof last?.status === 'string' ? last.status : undefined,
+        explorerUrl: typeof last?.explorerUrl === 'string' ? last.explorerUrl : undefined,
+      }
       if (leg.kind === 'hlBatch') {
         // Always the batch shape, even a single member: consumers read one thing.
         return {
           batch,
           orderResponse: last,
+          ...venue,
           detail: stopped ? `${detail.trim()} — stopped at member ${batch.length}: ${stopped.message}` : detail.trim(),
-          explorerUrl: typeof last?.explorerUrl === 'string' ? last.explorerUrl : undefined,
         }
       }
       // The single-action path has no re-offer contract: a refusal is the leg's.
       if (stopped) throw stopped
-      return {
-        orderResponse: last,
-        detail: detail.trim(),
-        explorerUrl: typeof last?.explorerUrl === 'string' ? last.explorerUrl : undefined,
-      }
+      return { orderResponse: last, ...venue, detail: detail.trim() }
     }
 
     if (leg.kind === 'order') {

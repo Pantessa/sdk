@@ -3,6 +3,8 @@ import { privateKeyToAccount } from 'viem/accounts'
 import {
   DeskError,
   DEFAULT_RPC,
+  DESK_LEG_RESULT_KEYS,
+  LEG_RESULT_KEYS,
   deskCall,
   deskExecuteConsentMessage,
   driveJob,
@@ -294,6 +296,8 @@ describe('driveJob', () => {
     const result = api.calls.find((c) => c.url.includes('/complete'))!.body!.result as DeskLegResult
     expect(result.txHash).toBe(HASH_B) // the LAST hash
     expect(result.txs).toHaveLength(2)
+    // `txs` entries carry exactly what the published type declares — no title.
+    for (const t of result.txs!) expect(Object.keys(t).sort()).toEqual(['chainId', 'hash'])
   })
 
   it('retries a pending re-quote, then signs the fresh calldata', async () => {
@@ -606,6 +610,29 @@ describe('driveJob', () => {
     expect(JSON.stringify(posted).length).toBeLessThanOrEqual(8 * 1024)
     expect(posted.orderResponse).toBeUndefined()
     expect(posted.detail).toContain('filled')
+  })
+
+  it('mirrors the app\'s DESK_LEG_RESULT_KEYS exactly — same keys, same order', () => {
+    // QA's sync pin reads this list against lib/desk-wire.ts, where it is tied
+    // to DeskLegResult by `satisfies`. Drift here is drift in the wire.
+    expect([...DESK_LEG_RESULT_KEYS]).toEqual([
+      'txHash', 'chainId', 'txs', 'orderResponse', 'fill', 'batch', 'detail', 'explorerUrl', 'status',
+    ])
+    expect(LEG_RESULT_KEYS).toBe(DESK_LEG_RESULT_KEYS)
+  })
+
+  it('reports the venue\'s own word and its fill under the keys the wire names', async () => {
+    const api = fakePantessa({
+      jobs: [job('waiting_signature', [hlStep()]), job('done', [{ ...hlStep(), status: 'done' }])],
+      hl: () => ({ status: 200, body: { status: 'filled', filled: { totalSz: '1.5', avgPx: '42.5' }, explorerUrl: 'https://app.hyperliquid.xyz/trade/HYPE' } }),
+    })
+    const { signer } = fakeSigner()
+    await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer, fetch: api.doFetch })
+    const result = api.calls.find((c) => c.url.includes('/complete'))!.body!.result as Record<string, unknown>
+    expect(result.status).toBe('filled')
+    expect(result.fill).toMatchObject({ totalSz: '1.5', avgPx: '42.5' })
+    expect(result.explorerUrl).toBe('https://app.hyperliquid.xyz/trade/HYPE')
+    for (const k of Object.keys(result)) expect(DESK_LEG_RESULT_KEYS).toContain(k)
   })
 
   it('never defaults a chain to publicnode', () => {
