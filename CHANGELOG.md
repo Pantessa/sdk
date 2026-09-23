@@ -21,7 +21,22 @@
   - `dryRun: true` classifies every leg and returns before the first
     broadcast; a leg the guard withheld comes back with its own sentence.
   - Typed `DeskError`s throughout — a raw `fetch` error never escapes — and a
-    leg shape the SDK will not guess at fails closed rather than signing.
+    leg shape the SDK will not guess at fails closed rather than signing. A
+    non-Hyperliquid order (CoW, Seaport) is refused by name.
+  - `DeskLegKind`, `DeskLegView`, `DeskLegResult`, `DeskNext`, `legViewOf` and
+    `deskNextOf` mirror the app's `lib/desk-wire.ts` line for line, constants
+    included (`HL_NONCE_LIFE_MS`, `LEG_OFFER_TTL_MS`, `BUILD_RETRY_MS`,
+    `SETTLE_RETRY_MS`); the app's harness pins the two in sync.
+  - A Hyperliquid batch is read from `orderRequest.batch`, signed in ONE pass
+    and submitted member by member in order; a failure stops the batch and its
+    partial result is still posted, so the runner re-offers from exactly there.
+    A leg whose nonce window has lapsed is rebuilt (`POST /api/jobs/{id}/retry`),
+    never re-signed.
+  - The execute consent carries an `Issued at:` line the desk checks both ways;
+    a desk that predates it gets the original text on one automatic retry.
+  - `headers` are stamped on every call the loop makes, and `pollMs` overrides
+    a cadence that otherwise follows the wire's own `BUILD_RETRY_MS` /
+    `SETTLE_RETRY_MS`.
   - `DEFAULT_RPC` holds each chain's own public endpoint and deliberately never
     publicnode (whose free tier refuses `eth_getTransactionReceipt`); pass
     `rpc` to use your own provider.

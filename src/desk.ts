@@ -41,11 +41,40 @@ import type { Account, Address, Chain, Hex, PublicClient, WalletClient } from 'v
 import { createPublicClient, createWalletClient, http } from 'viem'
 
 /* ── the leg wire (mirrors the server's lib/desk-wire.ts) ──────────────── */
+//
+// These types, constants and `legViewOf` are a line-for-line mirror of
+// `lib/desk-wire.ts` in the Pantessa app — the one place the artifact shapes
+// are named. The harness pins the two in sync. Keep them identical.
+//
+// SIGNING A HYPERLIQUID LEG — the #850 rule: the venue hashes the MSGPACK of
+// `hl.action`, msgpack is key-order sensitive, and Postgres `jsonb` sorts
+// object keys, so the action read out of a job step is NOT in the venue's
+// schema order. It does not need to be: the leg's `typedData` was built
+// server-side over the CANONICAL hash, so sign `typedData` VERBATIM, post the
+// action back as received, and `/api/hl/submit` re-canonicalizes before it
+// hashes, guards or relays. This module never re-serializes an artifact.
 
-/** What kind of signature a leg wants. Mirrors `DeskLegKind` server-side. */
-export type DeskLegKind = 'tx' | 'txChain' | 'hlAction' | 'hlBatch' | 'wait' | 'unknown'
+/** What kind of signature a leg wants. */
+export type DeskLegKind =
+  | 'tx'        // one EVM transaction
+  | 'txChain'   // N EVM transactions, in order
+  | 'hlAction'  // one Hyperliquid L1 action (EIP-712, domain chainId 1337)
+  | 'hlBatch'   // N Hyperliquid L1 actions signed in one motion (C2)
+  | 'order'     // a non-HL EIP-712 order: CoW swap / limit, Seaport listing
+  | 'wait'      // nothing to sign — the runner verifies settlement on-chain
+  | 'unknown'   // a shape this wire does not name yet: do not sign it blind
 
-/** One offered leg, classified. Mirrors `DeskLegView` server-side. */
+/** The Hyperliquid L1 domain chain id — a venue constant, never a network. */
+export const HL_DOMAIN_CHAIN_ID = 1337
+/** How long a Hyperliquid nonce stays signable. */
+export const HL_NONCE_LIFE_MS = 90_000
+/** How long the runner leaves a built artifact offered before rebuilding it. */
+export const LEG_OFFER_TTL_MS = 30 * 60_000
+/** How often to poll while the runner is building a leg. */
+export const BUILD_RETRY_MS = 3_000
+/** How often to poll while a wait leg settles (the GET advances it inline). */
+export const SETTLE_RETRY_MS = 10_000
+
 export interface DeskLegView {
   seq: number
   kind: DeskLegKind
@@ -56,23 +85,42 @@ export interface DeskLegView {
   /** The chain the signature belongs to (EVM id; 1337 for a Hyperliquid L1 action). */
   chainId: number | null
   valueUsd: number | null
-  /** ms until the material must be re-fetched (deadline calldata, HL nonce ~2 min). */
+  /** ms after which the material must be re-fetched. 0 = already stale, ask for
+   *  a rebuild. null = nothing to sign (a wait leg). */
   staleAfterMs: number | null
 }
 
-/** The evidence posted back for a signed leg. Mirrors `DeskLegResult`. */
 export interface DeskLegResult {
   txHash?: Hex
   chainId?: number
   /** Hyperliquid: the venue's response to the submitted action(s). */
   orderResponse?: unknown
-  /** hlBatch: one entry per member, in order; a missing entry = not submitted. */
+  /** hlBatch: one entry per SUBMITTED member, in order; a failed member is the
+   *  last entry with `ok: false` and the runner re-offers from it. */
   batch?: Array<{ ok: boolean; orderResponse?: unknown; error?: string }>
   /** Every confirmed hash of a txChain leg, in order. */
   txs?: Array<{ hash: Hex; chainId: number; title: string }>
   /** A human line the job card and the desk log show verbatim. */
   detail?: string
   explorerUrl?: string
+}
+
+export interface DeskNext {
+  leg: DeskLegView | null
+  /** Set when there is nothing to sign right now. */
+  waiting: string | null
+  retryAfterMs: number | null
+  jobStatus: string
+}
+
+/** One member of a batched Hyperliquid leg (C2). Each is signed on its OWN
+ *  `typedData` and submitted on its own, in order. */
+export interface HlBatchMemberLike {
+  kind?: string
+  action?: unknown
+  nonce?: number
+  typedData?: unknown
+  expected?: unknown
 }
 
 /* ── errors ───────────────────────────────────────────────────────────── */
@@ -274,100 +322,250 @@ function errorLine(body: Record<string, unknown>, fallback: string): string {
   return typeof e === 'string' && e ? e : fallback
 }
 
-/* ── classifying a leg ────────────────────────────────────────────────── */
+/* ── classifying a leg (the mirror of lib/desk-wire.ts) ───────────────── */
 
-/** A raw job step as the Jobs API serves it. */
-export interface JobStep {
+/** The raw Jobs-API step shape this wire reads. Structural on purpose. */
+export interface DeskStepLike {
   seq: number
-  kind: string
-  status: string
-  title?: string
-  builder?: string
+  kind?: string | null
+  status?: string | null
+  builder?: string | null
+  title?: string | null
   artifact?: unknown
-  guardReport?: unknown
   valueUsd?: number | null
   result?: unknown
+  /** When the runner last touched the step — the offer clock for a leg with
+   *  no deadline of its own. Date or ISO string (the Jobs API serializes it). */
+  updatedAt?: Date | string | number | null
 }
 
 /** A job as `GET /api/jobs/{id}?t=` serves it. */
-export interface JobView {
-  id: string
+export interface DeskJobLike {
+  id?: string
   status: string
   currentStep: number
-  steps: JobStep[]
+  steps: DeskStepLike[]
   valueUsd?: number | null
   failReason?: string | null
 }
 
-const HL_NONCE_MAX_AGE_MS = 120_000
+/** @deprecated use {@link DeskStepLike}. */
+export type JobStep = DeskStepLike
+/** @deprecated use {@link DeskJobLike}. */
+export type JobView = DeskJobLike
 
-function obj(v: unknown): Record<string, unknown> | null {
-  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
+const obj = (v: unknown): Record<string, unknown> | null =>
+  v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
+
+const str = (v: unknown): string | null => {
+  if (typeof v !== 'string') return null
+  const t = v.replace(/\s+/g, ' ').trim()
+  return t ? t : null
 }
 
-function num(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null
+const num = (v: unknown): number | null => {
+  const n = typeof v === 'string' ? Number(v) : v
+  return typeof n === 'number' && Number.isFinite(n) ? n : null
 }
 
-/**
- * Classify a raw Jobs-API step into the one view every consumer reads.
- *
- * The mirror of `legViewOf` in the server's `lib/desk-wire.ts`. Note the key:
- * single-transaction artifacts are `txRequest`, not `tx`.
- */
-export function legViewOfStep(step: JobStep): DeskLegView {
-  const a = obj(step.artifact)
-  const base = {
+const msOf = (v: unknown): number | null => {
+  if (v instanceof Date) return v.getTime()
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (typeof v === 'string') {
+    const t = Date.parse(v)
+    return Number.isFinite(t) ? t : null
+  }
+  return null
+}
+
+/** The one EVM tx a `txRequest` leg carries. `tx` is accepted as an alias. */
+function txOf(artifact: Record<string, unknown>): Record<string, unknown> | null {
+  return obj(artifact.txRequest) ?? obj(artifact.tx)
+}
+
+/** The members of a batched HL leg, in order. `orderRequest.batch` is the
+ *  contract; `orderRequest.hl.batch` is tolerated. Empty = not a batch. */
+export function hlBatchOf(order: Record<string, unknown> | null): HlBatchMemberLike[] {
+  if (!order) return []
+  const top = order.batch
+  const nested = obj(order.hl)?.batch
+  const raw = Array.isArray(top) ? top : Array.isArray(nested) ? nested : []
+  return raw.filter((m): m is HlBatchMemberLike => !!obj(m))
+}
+
+function chainOf(artifact: Record<string, unknown> | null, kind: DeskLegKind): number | null {
+  if (kind === 'hlAction' || kind === 'hlBatch') return HL_DOMAIN_CHAIN_ID
+  if (!artifact) return null
+  if (kind === 'tx') return num(txOf(artifact)?.chainId)
+  if (kind === 'txChain') {
+    const steps = obj(artifact.txChain)?.steps
+    if (!Array.isArray(steps)) return null
+    for (const st of steps) {
+      const c = num(obj(obj(st)?.tx)?.chainId)
+      if (c != null) return c
+    }
+    return null
+  }
+  if (kind === 'order') return num(obj(artifact.orderRequest)?.chainId)
+  return null
+}
+
+/** Classify the artifact. Fails to `unknown` rather than guessing — an agent
+ *  must never blind-sign a shape this wire cannot name. */
+function kindOf(step: DeskStepLike, artifact: Record<string, unknown> | null): DeskLegKind {
+  if (step.kind === 'wait') return 'wait'
+  if (!artifact) return step.kind === 'sign' ? 'unknown' : 'wait'
+  const order = obj(artifact.orderRequest)
+  if (order) {
+    if (str(order.protocol)?.toLowerCase() === 'hyperliquid') {
+      return hlBatchOf(order).length > 0 ? 'hlBatch' : 'hlAction'
+    }
+    return 'order'
+  }
+  const chain = obj(artifact.txChain)
+  if (chain && Array.isArray(chain.steps) && chain.steps.length > 0) return 'txChain'
+  if (txOf(artifact)) return 'tx'
+  return 'unknown'
+}
+
+/** How long the material stays signable, in ms from `now`. */
+function staleOf(kind: DeskLegKind, artifact: Record<string, unknown> | null, step: DeskStepLike, now: number): number | null {
+  if (kind === 'wait') return null
+  const clamp = (at: number | null) => (at == null ? null : Math.max(0, at - now))
+  if (artifact) {
+    if (kind === 'hlAction' || kind === 'hlBatch') {
+      const order = obj(artifact.orderRequest)
+      // A batch is minted on ascending nonces in one motion, so the EARLIEST
+      // member is the clock the whole leg shares.
+      const members = hlBatchOf(order)
+      const first = members.length > 0 ? num(members[0]?.nonce) : num(obj(order?.hl)?.nonce)
+      if (first != null) return clamp(first + HL_NONCE_LIFE_MS)
+    }
+    if (kind === 'txChain') {
+      const steps = obj(artifact.txChain)?.steps
+      let soonest: number | null = null
+      if (Array.isArray(steps)) {
+        for (const st of steps) {
+          const v = num(obj(st)?.validUntil)
+          // validUntil is unix SECONDS.
+          if (v != null && (soonest == null || v < soonest)) soonest = v
+        }
+      }
+      if (soonest != null) return clamp(soonest * 1000)
+    }
+    if (kind === 'tx') {
+      // A cross-chain deposit address is the venue's and it expires.
+      const expires = msOf(artifact.addressExpires)
+      if (expires != null) return clamp(expires)
+    }
+  }
+  const touched = msOf(step.updatedAt)
+  return touched == null ? null : clamp(touched + LEG_OFFER_TTL_MS)
+}
+
+/** One plain sentence: what signing this leg does. Composed from what the
+ *  runner already stamps — never invented. */
+function summaryOf(kind: DeskLegKind, artifact: Record<string, unknown> | null, step: DeskStepLike): string {
+  const base = (artifact && str(artifact.summary)) ?? str(step.title) ?? fallbackSummary(kind)
+  const extras: string[] = []
+  if (kind === 'txChain') {
+    const raw = obj(artifact?.txChain)?.steps
+    const steps: unknown[] = Array.isArray(raw) ? raw : []
+    if (steps.length > 1) {
+      const labels = steps.map((st) => str(obj(st)?.label) ?? str(obj(st)?.title) ?? 'transaction')
+      extras.push(`${steps.length} transactions in order: ${labels.join(' → ')}`)
+    }
+    if (obj(artifact?.txChain)?.refresh) extras.push('one step re-quotes before it is signed (POST /api/tx/refresh)')
+  }
+  if (kind === 'tx' && artifact && str(artifact.depositAddress)) {
+    extras.push('pays a one-time deposit address the guard pinned — the address expires')
+  }
+  if (kind === 'hlAction' || kind === 'hlBatch') {
+    const hl = obj(obj(artifact?.orderRequest)?.hl)
+    if (hl?.pre) extras.push('a guarded leverage update signs first, then the order')
+    if (hl?.feeApproval) extras.push('a one-time builder-fee approval signs first')
+    if (kind === 'hlBatch') {
+      const members = hlBatchOf(obj(artifact?.orderRequest))
+      const named = members.map((m) => str(m.kind) ?? 'action').join(' → ')
+      extras.push(`${members.length} Hyperliquid actions signed in one motion and submitted in order: ${named}; the first failure stops the batch`)
+    }
+  }
+  if (kind === 'order') {
+    const protocol = str(obj(artifact?.orderRequest)?.protocol)
+    if (protocol) extras.push(`${protocol} order — signing it is off-chain; the venue settles it`)
+    if (obj(artifact?.orderRequest)?.prereqTx) extras.push('a one-time on-chain approval signs first')
+  }
+  return extras.length ? `${base} (${extras.join('; ')})` : base
+}
+
+function fallbackSummary(kind: DeskLegKind): string {
+  switch (kind) {
+    case 'wait': return 'Wait for settlement — the runner verifies it on-chain.'
+    case 'tx': return 'Sign one transaction.'
+    case 'txChain': return 'Sign a chain of transactions in order.'
+    case 'hlAction': return 'Sign a Hyperliquid action.'
+    case 'hlBatch': return 'Sign a batch of Hyperliquid actions.'
+    case 'order': return 'Sign an off-chain order.'
+    default: return 'This leg carries a shape the desk wire does not name — do not sign it; poll again or ask a human.'
+  }
+}
+
+/** Classify a raw Jobs-API step into the one view every consumer reads.
+ *  Pure. The artifact rides through by REFERENCE — no clone, no JSON round
+ *  trip — so a Hyperliquid action reaches the signer exactly as stored. */
+export function legViewOf(step: DeskStepLike, now: number = Date.now()): DeskLegView {
+  const artifact = obj(step.artifact)
+  const kind = kindOf(step, artifact)
+  return {
     seq: step.seq,
-    summary: String((a?.summary as string | undefined) ?? step.title ?? ''),
-    valueUsd: num(step.valueUsd),
+    kind,
+    summary: summaryOf(kind, artifact, step),
+    artifact: kind === 'wait' ? null : artifact,
+    chainId: chainOf(artifact, kind),
+    valueUsd: step.valueUsd ?? null,
+    staleAfterMs: staleOf(kind, artifact, step, now),
+  }
+}
+
+/** @deprecated use {@link legViewOf}. */
+export const legViewOfStep = legViewOf
+
+const TERMINAL: Record<string, string> = {
+  done: 'done — every leg completed.',
+  failed: 'failed — read the job\u2019s failReason; nothing further will be offered.',
+  canceled: 'canceled — the job was closed; nothing further will be offered.',
+}
+
+/** The whole "what should I do right now" answer, from a job + its steps.
+ *  Exactly one of `leg` / `waiting` is set. Pure. */
+export function deskNextOf(job: DeskJobLike, now: number = Date.now()): DeskNext {
+  const terminal = TERMINAL[job.status]
+  if (terminal) return { leg: null, waiting: terminal, retryAfterMs: null, jobStatus: job.status }
+
+  const step = job.steps.find((x) => x.seq === job.currentStep) ?? job.steps.find((x) => x.status === 'offered')
+  if (!step) {
+    return { leg: null, waiting: 'the runner is rolling the job up — poll again.', retryAfterMs: BUILD_RETRY_MS, jobStatus: job.status }
+  }
+  if (step.status === 'offered' && step.kind === 'sign') {
+    return { leg: legViewOf(step, now), waiting: null, retryAfterMs: null, jobStatus: job.status }
+  }
+  if (step.status === 'failed') {
+    return { leg: null, waiting: `leg ${step.seq + 1} failed — the job will not offer it again without a retry.`, retryAfterMs: null, jobStatus: job.status }
   }
   if (step.kind === 'wait') {
-    return { ...base, kind: 'wait', artifact: null, chainId: null, staleAfterMs: null }
-  }
-  if (!a) return { ...base, kind: 'unknown', artifact: null, chainId: null, staleAfterMs: null }
-
-  const tx = obj(a.txRequest)
-  if (tx) {
-    return { ...base, kind: 'tx', artifact: a, chainId: num(tx.chainId), staleAfterMs: null }
-  }
-
-  const chain = obj(a.txChain)
-  if (chain && Array.isArray(chain.steps)) {
-    const steps = chain.steps as Array<Record<string, unknown>>
-    const first = obj(steps[0]?.tx)
-    const deadlines = steps.map((s) => num(s.validUntil)).filter((n): n is number => n !== null)
-    const soonest = deadlines.length ? Math.min(...deadlines) : null
     return {
-      ...base,
-      kind: 'txChain',
-      artifact: a,
-      chainId: num(first?.chainId),
-      staleAfterMs: soonest === null ? null : soonest * 1000 - Date.now(),
+      leg: null,
+      waiting: `${str(step.title) ?? `leg ${step.seq + 1}`} — waiting for on-chain settlement; the runner verifies it, nothing to sign.`,
+      retryAfterMs: SETTLE_RETRY_MS,
+      jobStatus: job.status,
     }
   }
-
-  const order = obj(a.orderRequest)
-  if (order) {
-    const hl = obj(order.hl)
-    if (order.protocol === 'hyperliquid' && hl) {
-      const batch = Array.isArray(hl.batch) ? (hl.batch as unknown[]) : null
-      const nonces = [num(hl.nonce), ...(batch ?? []).map((m) => num(obj(m)?.nonce))].filter(
-        (n): n is number => n !== null,
-      )
-      const oldest = nonces.length ? Math.min(...nonces) : null
-      return {
-        ...base,
-        kind: batch && batch.length > 0 ? 'hlBatch' : 'hlAction',
-        artifact: a,
-        chainId: 1337,
-        staleAfterMs: oldest === null ? null : oldest + HL_NONCE_MAX_AGE_MS - Date.now(),
-      }
-    }
-    return { ...base, kind: 'unknown', artifact: a, chainId: num(order.chainId), staleAfterMs: null }
+  return {
+    leg: null,
+    waiting: `leg ${step.seq + 1} (${str(step.title) ?? step.builder ?? 'building'}) is being built fresh and guard-checked — poll again.`,
+    retryAfterMs: BUILD_RETRY_MS,
+    jobStatus: job.status,
   }
-
-  return { ...base, kind: 'unknown', artifact: a, chainId: null, staleAfterMs: null }
 }
 
 /* ── driveJob ─────────────────────────────────────────────────────────── */
@@ -391,10 +589,12 @@ export interface DriveJobOptions {
    * runner still building, or a step WITHHELD because the wallet can't fund
    * it yet. `withheld` carries the runner's own honest sentence.
    */
-  onWaiting?: (note: { seq: number; status: string; title: string; withheld?: string }) => void | Promise<void>
+  onWaiting?: (note: { seq: number; status: string; title: string; waiting?: string; withheld?: string }) => void | Promise<void>
   /** Stop after this many signed legs (default 12). */
   maxLegs?: number
-  /** Poll interval in ms (default 4000). */
+  /** Force a poll interval in ms. Omitted, the loop uses the wire's own
+   *  cadence — `BUILD_RETRY_MS` while a leg builds, `SETTLE_RETRY_MS` while
+   *  one settles. */
   pollMs?: number
   /** Give up after this long (default 30 min). */
   timeoutMs?: number
@@ -402,6 +602,10 @@ export interface DriveJobOptions {
   dryRun?: boolean
   /** The chainId that goes inside a one-time Hyperliquid builder-fee approval. */
   hlSignatureChainId?: number
+  /** Extra headers on every call this loop makes — the Jobs API, the re-quote
+   *  route and the Hyperliquid relay alike (e.g. `x-yf-internal-run` on a
+   *  drill, so the rows it mints never read as growth). */
+  headers?: Record<string, string>
   /** Swap in a custom fetch (tests, proxies, extra headers). */
   fetch?: FetchLike
 }
@@ -425,6 +629,11 @@ export interface DriveJobOutcome {
 }
 
 const ACTIVE = new Set(['running', 'waiting_signature', 'waiting_settlement', 'paused'])
+
+/** How many times one leg may be rebuilt after going stale before giving up. */
+const MAX_REBUILDS = 3
+/** How many times one leg may be offered (a batch re-offers from its failed member). */
+const MAX_LEG_ATTEMPTS = 4
 
 /**
  * Drive a Pantessa job leg by leg with your own signer.
@@ -451,10 +660,11 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
     onDone,
     onWaiting,
     maxLegs = 12,
-    pollMs = 4000,
+    pollMs,
     timeoutMs = 30 * 60_000,
     dryRun = false,
     hlSignatureChainId = 42161,
+    headers = {},
   } = options
   const doFetch = options.fetch ?? globalThis.fetch.bind(globalThis)
   const origin = base.replace(/\/$/, '')
@@ -464,6 +674,8 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
   const results: Array<{ seq: number; result: DeskLegResult }> = []
   const publicClients = new Map<number, PublicClient>()
   const seen = new Set<number>()
+  const attempts = new Map<number, number>()
+  const rebuilds = new Map<number, number>()
   const deadline = Date.now() + timeoutMs
 
   const publicClientFor = (chainId: number): PublicClient => {
@@ -516,7 +728,7 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
     for (let attempt = 0; attempt < 5; attempt++) {
       const res = await doFetch(`${origin}/api/tx/refresh`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...headers },
         body: JSON.stringify({ kind: recipe.kind, ...recipe.params, from: me.address }),
       }).catch((e: unknown) => {
         throw new DeskError('http', `POST /api/tx/refresh failed: ${asError(e).message}`, { cause: e })
@@ -546,25 +758,27 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
   }
 
   /** Sign + submit ONE Hyperliquid L1 action through the relay. */
+  /** Sign one member's typed data, verbatim. Never re-serialize the action. */
+  const signHl = async (member: { typedData: unknown }): Promise<Hex> => {
+    const td = obj(member.typedData)
+    if (!td) throw new DeskError('unsupported-leg', 'The Hyperliquid action carries no typed data to sign.')
+    return me.signTypedData(td as unknown as TypedDataLike)
+  }
+
+  /** Relay ONE already-signed Hyperliquid L1 action, `mode: 'direct'`. */
   const submitHl = async (member: {
     action: unknown
     nonce: number
-    typedData: unknown
     expected: Record<string, unknown>
     isTestnet: boolean
+    signature: Hex
   }): Promise<Record<string, unknown>> => {
-    if (member.nonce + HL_NONCE_MAX_AGE_MS <= Date.now()) {
-      throw new DeskError('stale', 'This Hyperliquid build is older than the venue nonce window — ask for a fresh one.')
-    }
-    const td = obj(member.typedData)
-    if (!td) throw new DeskError('unsupported-leg', 'The Hyperliquid action carries no typed data to sign.')
-    // Sign the BYTES the API handed back. The action is never re-serialized:
-    // its key order is part of the venue's msgpack hash.
-    const signature = await me.signTypedData(td as unknown as TypedDataLike)
+    const signature = member.signature
     const res = await doFetch(`${origin}/api/hl/submit`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify({
+        mode: 'direct',
         action: member.action,
         nonce: member.nonce,
         isTestnet: member.isTestnet,
@@ -621,7 +835,7 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
     })
     const res = await doFetch(`${origin}/api/hl/submit`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify({ action, nonce, isTestnet, signature, from: me.address }),
     }).catch((e: unknown) => {
       throw new DeskError('http', `POST /api/hl/submit (fee cap) failed: ${asError(e).message}`, { cause: e })
@@ -672,32 +886,20 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
 
     if (leg.kind === 'hlAction' || leg.kind === 'hlBatch') {
       const order = obj(a.orderRequest)!
-      const hl = obj(order.hl)!
+      const hl = obj(order.hl) ?? {}
       const isTestnet = hl.isTestnet === true
       const expected = obj(hl.expected) ?? {}
-      const fee = obj(hl.feeApproval)
-      if (fee && typeof fee.builder === 'string' && typeof fee.maxFeeRate === 'string') {
-        await approveBuilderFee({ builder: fee.builder, maxFeeRate: fee.maxFeeRate }, isTestnet)
-      }
 
-      // Members, in the order the venue must see them: the guarded pre-action
-      // (a leverage set), then the batch or the single order.
-      type Member = { action: unknown; nonce: number; typedData: unknown; expected: Record<string, unknown> }
+      type Member = { kind: string; action: unknown; nonce: number; typedData: unknown; expected: Record<string, unknown> }
       const members: Member[] = []
-      const pre = obj(hl.pre)
-      if (pre) {
-        members.push({
-          action: pre.action,
-          nonce: num(pre.nonce) ?? 0,
-          typedData: pre.typedData,
-          expected: { coin: expected.coin, leverage: obj(pre.expected)?.leverage },
-        })
-      }
+
       if (leg.kind === 'hlBatch') {
-        for (const raw of hl.batch as unknown[]) {
-          const m = obj(raw)
-          if (!m) throw new DeskError('unsupported-leg', `Leg ${leg.seq} carries a malformed batch member.`)
+        // C2: the members live at the TOP level of orderRequest (`hl.batch` is
+        // tolerated), already in submission order with ascending nonces, the
+        // `order` member last. A batch never carries a one-time fee approval.
+        for (const m of hlBatchOf(order)) {
           members.push({
+            kind: str(m.kind) ?? 'action',
             action: m.action,
             nonce: num(m.nonce) ?? 0,
             typedData: m.typedData,
@@ -705,43 +907,90 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
           })
         }
       } else {
+        // The single-action path, exactly as the browser card signs it: the
+        // one-time builder-fee cap (a wallet-chain signature, not an L1
+        // action), then the guarded leverage pre-step, then the order.
+        const fee = obj(hl.feeApproval)
+        if (fee && typeof fee.builder === 'string' && typeof fee.maxFeeRate === 'string') {
+          await approveBuilderFee({ builder: fee.builder, maxFeeRate: fee.maxFeeRate }, isTestnet)
+        }
+        const pre = obj(hl.pre)
+        if (pre) {
+          members.push({
+            kind: 'leverage',
+            action: pre.action,
+            nonce: num(pre.nonce) ?? 0,
+            typedData: pre.typedData,
+            expected: { coin: expected.coin, leverage: obj(pre.expected)?.leverage },
+          })
+        }
         members.push({
+          kind: 'order',
           action: hl.action,
           nonce: num(hl.nonce) ?? 0,
           typedData: order.typedData,
           expected: { coin: expected.coin, kind: expected.kind, isBuy: expected.isBuy },
         })
       }
+      if (members.length === 0) {
+        throw new DeskError('unsupported-leg', `Leg ${leg.seq} names Hyperliquid but carries nothing to sign.`)
+      }
+
+      // Sign every member in ONE pass, then submit in order. The nonce window
+      // is shared (the earliest nonce is the clock), so a pause between
+      // signatures is what ages the whole leg out.
+      const signed: Array<Member & { signature: Hex }> = []
+      for (const m of members) signed.push({ ...m, signature: await signHl(m) })
 
       const batch: Array<{ ok: boolean; orderResponse?: unknown; error?: string }> = []
       let last: Record<string, unknown> | null = null
-      for (const m of members) {
+      let stopped: Error | null = null
+      for (const m of signed) {
         try {
           last = await submitHl({ ...m, isTestnet })
           batch.push({ ok: true, orderResponse: last })
         } catch (e) {
-          // A failed member stops the batch — the runner re-offers from it.
+          // A failed member stops the batch. Its result is still POSTed: the
+          // runner re-arms the step and re-offers it from the failed member
+          // (a leverage the venue already applied is skipped by the builder).
           batch.push({ ok: false, error: asError(e).message })
-          if (leg.kind === 'hlBatch') {
-            const err = new DeskError('http', `Hyperliquid batch stopped at member ${batch.length}: ${asError(e).message}`, {
-              detail: JSON.stringify(batch),
-              cause: e,
-            })
-            throw err
-          }
-          throw e
+          stopped = asError(e)
+          break
         }
       }
+
       const filled = obj(last?.filled)
       const detail = filled
         ? `${String(expected.kind ?? 'order')} ${String(expected.coin ?? '')} filled ${String(filled.totalSz)} @ ${String(filled.avgPx)}`
         : `${String(expected.kind ?? 'order')} ${String(expected.coin ?? '')}`
+
+      if (leg.kind === 'hlBatch') {
+        // Always the batch shape, even a single member: consumers read one thing.
+        return {
+          batch,
+          orderResponse: last,
+          detail: stopped ? `${detail.trim()} — stopped at member ${batch.length}: ${stopped.message}` : detail.trim(),
+          explorerUrl: typeof last?.explorerUrl === 'string' ? last.explorerUrl : undefined,
+        }
+      }
+      // The single-action path has no re-offer contract: a refusal is the leg's.
+      if (stopped) throw stopped
       return {
         orderResponse: last,
-        ...(leg.kind === 'hlBatch' ? { batch } : {}),
         detail: detail.trim(),
         explorerUrl: typeof last?.explorerUrl === 'string' ? last.explorerUrl : undefined,
       }
+    }
+
+    if (leg.kind === 'order') {
+      const protocol = str(obj(a.orderRequest)?.protocol) ?? 'unknown'
+      throw new DeskError(
+        'unsupported-leg',
+        `Leg ${leg.seq} is a ${protocol} order. pantessa/desk signs Hyperliquid actions and EVM transactions; ` +
+          'an off-chain order has its own submit endpoint and prerequisites, so this loop will not guess at it — ' +
+          'hand this leg to a human sign link (broker_handoff) or sign it yourself.',
+        { detail: leg.summary },
+      )
     }
 
     throw new DeskError(
@@ -757,7 +1006,7 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
       throw new DeskError('http', `Job ${jobId} did not finish within ${Math.round(timeoutMs / 1000)}s.`)
     }
     const res = await doFetch(`${origin}/api/jobs/${jobId}?t=${encodeURIComponent(token)}`, {
-      headers: { accept: 'application/json' },
+      headers: { accept: 'application/json', ...headers },
     }).catch((e: unknown) => {
       throw new DeskError('http', `GET /api/jobs/${jobId} failed: ${asError(e).message}`, { cause: e })
     })
@@ -767,12 +1016,13 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
         status: res.status,
       })
     }
-    const job = obj(body.job) as unknown as JobView | null
+    const job = obj(body.job) as unknown as DeskJobLike | null
     if (!job) throw new DeskError('http', `GET /api/jobs/${jobId} answered without a job.`)
 
-    const step = (job.steps ?? []).find((s) => s.seq === job.currentStep)
-    if (step && step.status === 'offered' && step.kind === 'sign' && step.artifact) {
-      const leg = legViewOfStep(step)
+    const next = deskNextOf(job)
+    const step = (job.steps ?? []).find((x) => x.seq === job.currentStep)
+    if (next.leg) {
+      const leg = next.leg
       if (!seen.has(leg.seq)) {
         seen.add(leg.seq)
         legs.push(leg)
@@ -782,10 +1032,40 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
       if (results.length >= maxLegs) {
         throw new DeskError('max-legs', `Stopped after ${maxLegs} signed legs (job ${jobId} is still running).`)
       }
+      // A build whose clock has run out is REBUILT, never re-signed: the
+      // Hyperliquid nonce window is 90s while the offer stands for 30 min.
+      if (leg.staleAfterMs !== null && leg.staleAfterMs <= 0) {
+        const tries = (rebuilds.get(leg.seq) ?? 0) + 1
+        if (tries > MAX_REBUILDS) {
+          throw new DeskError('stale', `Leg ${leg.seq} went stale ${MAX_REBUILDS} times before it could be signed — ask again for a fresh job.`)
+        }
+        rebuilds.set(leg.seq, tries)
+        const again = await doFetch(`${origin}/api/jobs/${jobId}/retry?t=${encodeURIComponent(token)}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...headers },
+        }).catch((e: unknown) => {
+          throw new DeskError('http', `POST /api/jobs/${jobId}/retry failed: ${asError(e).message}`, { cause: e })
+        })
+        if (!again.ok) {
+          const rbody = await readJson(again)
+          throw new DeskError('stale', `Leg ${leg.seq} is stale and the runner would not rebuild it: ${errorLine(rbody, 'retry refused')}`, {
+            status: again.status,
+          })
+        }
+        if (onWaiting) await onWaiting({ seq: leg.seq, status: 'rebuilding', title: leg.summary })
+        seen.delete(leg.seq)
+        await sleep(pollMs ?? BUILD_RETRY_MS)
+        continue
+      }
+      const signed = (attempts.get(leg.seq) ?? 0) + 1
+      if (signed > MAX_LEG_ATTEMPTS) {
+        throw new DeskError('http', `Leg ${leg.seq} was re-offered ${MAX_LEG_ATTEMPTS} times without completing — stopping.`)
+      }
+      attempts.set(leg.seq, signed)
       const result = await signLeg(leg)
       const done = await doFetch(`${origin}/api/jobs/${jobId}/complete?t=${encodeURIComponent(token)}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...headers },
         body: JSON.stringify({ seq: leg.seq, result }),
       }).catch((e: unknown) => {
         throw new DeskError('http', `POST /api/jobs/${jobId}/complete failed: ${asError(e).message}`, { cause: e })
@@ -798,6 +1078,9 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
       }
       results.push({ seq: leg.seq, result })
       if (onDone) await onDone(leg.seq, result)
+      // A batch that stopped at a failed member IS posted: the runner re-arms
+      // the step and re-offers the SAME seq starting from that member.
+      if (result.batch?.some((m) => !m.ok)) seen.delete(leg.seq)
       continue // the runner advances inline; read the next leg at once
     }
 
@@ -811,8 +1094,9 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
     if (step && onWaiting) {
       await onWaiting({
         seq: step.seq,
-        status: step.status,
+        status: String(step.status ?? ''),
         title: String(step.title ?? ''),
+        waiting: next.waiting ?? undefined,
         ...(withheldReason ? { withheld: withheldReason } : {}),
       })
     }
@@ -828,7 +1112,7 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
     if (!ACTIVE.has(job.status)) {
       throw new DeskError('http', `Job ${jobId} is in an unknown state "${job.status}".`)
     }
-    await sleep(pollMs)
+    await sleep(pollMs ?? next.retryAfterMs ?? BUILD_RETRY_MS)
   }
 }
 
@@ -889,13 +1173,27 @@ export interface OpenAndExecuteResult {
 
 /**
  * The consent text a wallet signs to prove it owns an agent-signed intent.
- * Mirrors `deskExecuteConsentMessage` server-side, byte for byte.
+ *
+ * Mirrors `deskExecuteConsentMessage` in the Pantessa app, **byte for byte**.
+ * The desk recovers the signer from the text IT builds, so a single character
+ * of drift here recovers to a different address and reads to the caller like a
+ * wallet bug. The harness pins the two copies line for line.
+ *
+ * With `issuedAt` (an ISO timestamp) the text carries a freshness line, which
+ * the desk checks both ways inside a ten-minute window; without it, the
+ * original four-line text. `openAndExecute` signs the fresh form and falls
+ * back to the original once if the desk has not shipped it yet.
+ *
+ * TODO-verify: the `Issued at:` line's exact format is the squad's decision of
+ * record (agent-desk squad, C1) but the server side had not landed when this
+ * was written — re-pin against `lib/broker-exec.ts` before publishing.
  */
-export function deskExecuteConsentMessage(intentId: string, wallet: string): string {
+export function deskExecuteConsentMessage(intentId: string, wallet: string, issuedAt?: string): string {
   return [
     'Pantessa agent desk — execute consent',
     `Intent: ${intentId}`,
     `Wallet: ${wallet.toLowerCase()}`,
+    ...(issuedAt ? [`Issued at: ${issuedAt}`] : []),
     "Signing lets the desk compile this intent into a job owned by this wallet. It moves nothing by itself; every leg still needs this wallet's own signature.",
   ].join('\n')
 }
@@ -1028,8 +1326,27 @@ export async function openAndExecute(options: OpenAndExecuteOptions): Promise<Op
     plan = obj(re.plan) ?? plan
   }
 
-  const walletSignature = await me.signMessage(deskExecuteConsentMessage(intentId, me.address))
-  const exec = await call('broker_execute', { intent_id: intentId, wallet_signature: walletSignature })
+  // Signed immediately before the call so the freshness window is the
+  // round-trip, not however long the negotiation took.
+  const issuedAt = new Date().toISOString()
+  let exec: Record<string, unknown>
+  try {
+    exec = await call('broker_execute', {
+      intent_id: intentId,
+      issued_at: issuedAt,
+      wallet_signature: await me.signMessage(deskExecuteConsentMessage(intentId, me.address, issuedAt)),
+    })
+  } catch (e) {
+    // A desk that has not shipped the freshness line recovers a different
+    // address from our text and refuses the wallet proof. That must not read
+    // as a wallet bug, so sign the original text once and try again.
+    const refusedProof = e instanceof DeskError && e.code === 'desk-refused' && /wallet_signature|consent|recovers/i.test(e.message)
+    if (!refusedProof) throw e
+    exec = await call('broker_execute', {
+      intent_id: intentId,
+      wallet_signature: await me.signMessage(deskExecuteConsentMessage(intentId, me.address)),
+    })
+  }
 
   const jobId = typeof exec.jobId === 'string' ? exec.jobId : ''
   const drive = obj(exec.drive)
