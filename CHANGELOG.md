@@ -41,7 +41,8 @@
     the same nine, in the same order, as the desk's own list), with a lowercase
     64-hex hash; an oversized venue response is dropped rather than breaching
     the 8 KiB cap. A Hyperliquid leg reports the venue's `status` and `fill`
-    under their own keys.
+    under their own keys; a `txChain` leg reports every hash with the runner's
+    own per-transaction label (`txs[].title`).
   - `headers` are stamped on every call the loop makes, and `pollMs` overrides
     a cadence that otherwise follows the wire's own `BUILD_RETRY_MS` /
     `SETTLE_RETRY_MS`.

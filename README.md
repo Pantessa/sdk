@@ -475,7 +475,8 @@ a signature. Every failure this module raises is a `DeskError` with a `code`
   and a lowercase 64-hex hash; an oversized venue response is dropped rather
   than breaching the runner's 8 KiB cap. The runner refuses an unnamed key
   rather than reshaping it. A Hyperliquid leg reports the venue's own `status`
-  and `fill` under their own keys, not buried in `orderResponse`.
+  and `fill` under their own keys, not buried in `orderResponse`; a `txChain`
+  leg reports every hash with the runner's own per-transaction label.
 - **The types are a mirror.** `DeskLegKind`, `DeskLegView`, `DeskLegResult`,
   `DeskNext`, `legViewOf` and `deskNextOf` are line-for-line copies of
   `lib/desk-wire.ts` in the Pantessa app, and the app's harness pins the two in

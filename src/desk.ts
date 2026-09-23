@@ -54,15 +54,12 @@ import { createPublicClient, createWalletClient, http } from 'viem'
 // action back as received, and `/api/hl/submit` re-canonicalizes before it
 // hashes, guards or relays. This module never re-serializes an artifact.
 
-/** What kind of signature a leg wants. */
-export type DeskLegKind =
-  | 'tx'        // one EVM transaction
-  | 'txChain'   // N EVM transactions, in order
-  | 'hlAction'  // one Hyperliquid L1 action (EIP-712, domain chainId 1337)
-  | 'hlBatch'   // N Hyperliquid L1 actions signed in one motion (C2)
-  | 'order'     // a non-HL EIP-712 order: CoW swap / limit, Seaport listing
-  | 'wait'      // nothing to sign — the runner verifies settlement on-chain
-  | 'unknown'   // a shape this wire does not name yet: do not sign it blind
+/** What kind of signature a leg wants. One line, like the app's — pins parse it.
+ *  `tx` one EVM transaction · `txChain` N of them in order · `hlAction` one
+ *  Hyperliquid L1 action (EIP-712, domain chainId 1337) · `hlBatch` N of those
+ *  signed in one motion · `order` a non-HL EIP-712 order (CoW, Seaport) ·
+ *  `wait` nothing to sign · `unknown` a shape this wire does not name yet. */
+export type DeskLegKind = 'tx' | 'txChain' | 'hlAction' | 'hlBatch' | 'order' | 'wait' | 'unknown'
 
 /** The Hyperliquid L1 domain chain id — a venue constant, never a network. */
 export const HL_DOMAIN_CHAIN_ID = 1337
@@ -103,8 +100,11 @@ export interface DeskLegResult {
   /** EVM: the hash — of the LAST transaction for a txChain. Lowercase. */
   txHash?: Hex
   chainId?: number
-  /** EVM: every hash the leg produced, when the leg was more than one tx. */
-  txs?: Array<{ hash: string; chainId: number }>
+  /** EVM: every hash the leg produced, when the leg was more than one tx.
+   *  `title` is the per-transaction label of a chain ("Approve USDC" → "Swap")
+   *  — the browser's JobCard has always sent it, and it is what a desk log
+   *  shows for a txChain leg, so it is DECLARED rather than stripped. */
+  txs?: Array<{ hash: string; chainId: number; title?: string }>
   /** Hyperliquid / CoW / Seaport: the venue's response to the submitted action. */
   orderResponse?: unknown
   /** Hyperliquid: the fill, when the venue returned one separately. */
@@ -928,7 +928,7 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
       const chain = obj(a.txChain)!
       let steps = (chain.steps as Array<Record<string, unknown>>).slice()
       const recipe = obj(chain.refresh) as { kind: string; stepIndex: number; params: Record<string, string> } | null
-      const txs: Array<{ hash: string; chainId: number }> = []
+      const txs: Array<{ hash: string; chainId: number; title?: string }> = []
       for (let i = 0; i < steps.length; i++) {
         let step = steps[i]! as unknown as { title?: string; tx: LegTx & { chainId?: number }; validUntil?: number }
         // A step with a recipe is rebuilt right before it is offered: prices
@@ -942,7 +942,9 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
         const chainId = step.tx.chainId ?? leg.chainId
         if (!chainId) throw new DeskError('unsupported-leg', `Leg ${leg.seq} step ${i} names no chain.`)
         const hash = await send(step.tx, chainId)
-        txs.push({ hash, chainId })
+        // The runner's own label for the step, passed through — never invented.
+        const title = str(step.title)
+        txs.push({ hash, chainId, ...(title ? { title } : {}) })
       }
       const last = txs[txs.length - 1]
       if (!last) throw new DeskError('unsupported-leg', `Leg ${leg.seq} carries an empty transaction chain.`)

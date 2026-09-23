@@ -296,8 +296,10 @@ describe('driveJob', () => {
     const result = api.calls.find((c) => c.url.includes('/complete'))!.body!.result as DeskLegResult
     expect(result.txHash).toBe(HASH_B) // the LAST hash
     expect(result.txs).toHaveLength(2)
-    // `txs` entries carry exactly what the published type declares — no title.
-    for (const t of result.txs!) expect(Object.keys(t).sort()).toEqual(['chainId', 'hash'])
+    // `txs` entries carry the runner's own per-step label, which the wire declares.
+    for (const t of result.txs!) expect(Object.keys(t).sort()).toEqual(['chainId', 'hash', 'title'])
+    // …the PER-TRANSACTION label from the chain, not the job step's own title.
+    expect(result.txs!.map((t) => t.title)).toEqual(['Approve USDC', 'Swap USDC for ETH'])
   })
 
   it('retries a pending re-quote, then signs the fresh calldata', async () => {
