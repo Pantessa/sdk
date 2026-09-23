@@ -579,6 +579,35 @@ describe('driveJob', () => {
     expect(api.calls.some((c) => c.url.includes('/api/tx/refresh'))).toBe(true)
   })
 
+  it('posts a lowercase hash and only keys the runner names', async () => {
+    vi.resetModules()
+    withStubbedChain(['0xAAAA000000000000000000000000000000000000000000000000000000000001'])
+    const mod = await import('./desk.js')
+    const api = fakePantessa({ jobs: [job('waiting_signature', [txStep()]), job('done', [{ ...txStep(), status: 'done' }])] })
+    const { signer } = fakeSigner()
+    await mod.driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer, fetch: api.doFetch })
+    const result = api.calls.find((c) => c.url.includes('/complete'))!.body!.result as Record<string, unknown>
+    expect(result.txHash).toBe('0xaaaa000000000000000000000000000000000000000000000000000000000001')
+    expect(String(result.txHash)).toMatch(/^0x[0-9a-f]{64}$/)
+    for (const k of Object.keys(result)) expect(mod.LEG_RESULT_KEYS).toContain(k)
+    expect(result.note).toBeUndefined()
+  })
+
+  it('drops an oversized venue response rather than breaching the completion cap', async () => {
+    const huge = 'x'.repeat(20_000)
+    const step = hlStep(0)
+    const api = fakePantessa({
+      jobs: [job('waiting_signature', [step]), job('done', [{ ...step, status: 'done' }])],
+      hl: () => ({ status: 200, body: { status: 'filled', filled: { totalSz: '1', avgPx: '10' }, blob: huge } }),
+    })
+    const { signer } = fakeSigner()
+    await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer, fetch: api.doFetch })
+    const posted = api.calls.find((c) => c.url.includes('/complete'))!.body!.result as Record<string, unknown>
+    expect(JSON.stringify(posted).length).toBeLessThanOrEqual(8 * 1024)
+    expect(posted.orderResponse).toBeUndefined()
+    expect(posted.detail).toContain('filled')
+  })
+
   it('never defaults a chain to publicnode', () => {
     for (const url of Object.values(DEFAULT_RPC)) expect(url).not.toContain('publicnode')
   })
@@ -696,31 +725,45 @@ describe('openAndExecute', () => {
       "Signing lets the desk compile this intent into a job owned by this wallet. It moves nothing by itself; every leg still needs this wallet's own signature.",
     ])
     expect(call.args.wallet_signature as string).toMatch(/^0x[0-9a-f]{130}$/)
+    // agent_key is required on execute and compared timing-safe.
+    expect(call.args.agent_key).toBe('k')
   })
 
-  it('falls back to the original consent text once when the desk has not shipped the freshness line', async () => {
-    // Without this, a desk on the older text recovers a different address and
-    // the refusal reads to the caller like a broken wallet.
-    let first = true
-    const srv = deskServer({ broker_open: { intentId: 'int_1', plan: plan('covered') }, broker_execute: execReply })
+  it('pins the consent text byte for byte — five lines, U+2014, no trailing newline', () => {
+    const text = deskExecuteConsentMessage('abc123', '0xAbCdEf0123456789AbCdEf0123456789AbCdEf01', '2026-09-23T11:22:33.444Z')
+    expect(text).toBe(
+      'Pantessa agent desk \u2014 execute consent\n' +
+        'Intent: abc123\n' +
+        'Wallet: 0xabcdef0123456789abcdef0123456789abcdef01\n' +
+        'Issued at: 2026-09-23T11:22:33.444Z\n' +
+        "Signing lets the desk compile this intent into a job owned by this wallet. It moves nothing by itself; every leg still needs this wallet's own signature.",
+    )
+    expect(text.split('\n')).toHaveLength(5)
+    expect(text.endsWith('\n')).toBe(false)
+    expect(text.charCodeAt('Pantessa agent desk '.length)).toBe(0x2014)
+    // The apostrophe is ASCII U+0027, not a curly quote.
+    expect(text).toContain("wallet's own signature")
+    expect(text).not.toContain('\u2019')
+  })
+
+  it('never falls back to another consent spelling — drift fails loudly', async () => {
+    // A fallback that costs "one extra signature" HIDES drift; the desk
+    // rebuilds this text from our own issued_at, so a mismatch is a bug to
+    // see, not to paper over (QA F8).
+    const srv = deskServer({ broker_open: { intentId: 'int_1', plan: plan('covered') } })
     const guarded = (async (url: string, init?: RequestInit) => {
       const body = JSON.parse(String(init!.body)) as { id: number; params: { name: string } }
-      if (body.params.name === 'broker_execute' && first) {
-        first = false
-        return new Response(
-          `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: 'broker_execute needs wallet_signature — it recovers to a different wallet.' }], isError: true } })}\n\n`,
-          { status: 200, headers: { 'content-type': 'text/event-stream' } },
-        )
-      }
-      return srv.doFetch(url as never, init as never)
+      if (body.params.name !== 'broker_execute') return srv.doFetch(url as never, init as never)
+      return new Response(
+        `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: 'broker_execute needs wallet_signature — it recovers to a different wallet.' }], isError: true } })}\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
     }) as unknown as typeof fetch
     const { signer, messages } = fakeSigner()
-    const out = await openAndExecute({ base: 'http://x', ask: 'swap $5 of ETH', signer, agentKey: 'k', fetch: guarded })
-    expect(messages).toHaveLength(2)
-    expect(messages[0]).toContain('Issued at: ')
-    expect(messages[1]).toBe(deskExecuteConsentMessage('int_1', account.address))
-    expect(messages[1]).not.toContain('Issued at: ')
-    expect(out.jobId).toBe('job_9')
+    await expect(
+      openAndExecute({ base: 'http://x', ask: 'swap $5 of ETH', signer, agentKey: 'k', fetch: guarded }),
+    ).rejects.toMatchObject({ code: 'desk-refused' })
+    expect(messages).toHaveLength(1)
   })
 
   it('does NOT retry the consent when the desk refused for another reason', async () => {

@@ -461,11 +461,19 @@ a signature. Every failure this module raises is a `DeskError` with a `code`
   it makes (the Jobs API, the re-quote route, the relay) — that is where a
   drill puts `x-yf-internal-run`.
 - The consent `openAndExecute` signs is a plain `personal_sign` over one
-  readable sentence, carrying an `Issued at:` line the desk checks both ways.
-  It costs no gas and moves nothing by itself; every leg still needs this
-  wallet's own signature. A desk that predates the freshness line gets the
-  original text on one automatic retry, so the mismatch never reads as a
-  wallet failure.
+  readable sentence, carrying an `Issued at:` line the desk checks both ways
+  (ten minutes). It costs no gas and moves nothing by itself; every leg still
+  needs this wallet's own signature. The text is **byte-exact** with the
+  desk's own — it rebuilds the text from the `issued_at` you send and recovers
+  the signer from it, so there is deliberately **no fallback spelling**: drift
+  fails loudly rather than costing a silent extra signature.
+- **`agentKey` is required.** The agent-signed path has no human in the loop,
+  so `broker_execute` takes the same desk identity `broker_open` was given and
+  compares it timing-safe.
+- **Completions carry only the nine keys the runner names** (`LEG_RESULT_KEYS`)
+  and a lowercase 64-hex hash; an oversized venue response is dropped rather
+  than breaching the runner's 8 KiB cap. The runner refuses an unnamed key
+  rather than reshaping it.
 - **The types are a mirror.** `DeskLegKind`, `DeskLegView`, `DeskLegResult`,
   `DeskNext`, `legViewOf` and `deskNextOf` are line-for-line copies of
   `lib/desk-wire.ts` in the Pantessa app, and the app's harness pins the two in

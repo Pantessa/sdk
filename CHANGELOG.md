@@ -32,8 +32,14 @@
     partial result is still posted, so the runner re-offers from exactly there.
     A leg whose nonce window has lapsed is rebuilt (`POST /api/jobs/{id}/retry`),
     never re-signed.
-  - The execute consent carries an `Issued at:` line the desk checks both ways;
-    a desk that predates it gets the original text on one automatic retry.
+  - The execute consent is **byte-exact** with the desk's own five-line text,
+    carrying an `Issued at:` line checked both ways inside ten minutes, and
+    `broker_execute` takes `issued_at` + the required `agent_key`. No fallback
+    spelling: the desk rebuilds the text from the caller's own string, so drift
+    must fail loudly rather than cost a silent second signature.
+  - Completions carry only the keys the runner names (`LEG_RESULT_KEYS`), with
+    a lowercase 64-hex hash; an oversized venue response is dropped rather than
+    breaching the 8 KiB cap.
   - `headers` are stamped on every call the loop makes, and `pollMs` overrides
     a cadence that otherwise follows the wire's own `BUILD_RETRY_MS` /
     `SETTLE_RETRY_MS`.

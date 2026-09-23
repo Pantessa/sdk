@@ -630,6 +630,39 @@ export interface DriveJobOutcome {
 
 const ACTIVE = new Set(['running', 'waiting_signature', 'waiting_settlement', 'paused'])
 
+/** The only keys a leg's completion may carry (mirrors `LEG_RESULT_KEYS` in
+ *  the app's `lib/job-step-money.ts`). The runner REFUSES an unnamed key
+ *  rather than reshaping it, so this loop never invents one. */
+export const LEG_RESULT_KEYS = ['txHash', 'txs', 'chainId', 'orderResponse', 'batch', 'fill', 'detail', 'explorerUrl', 'status'] as const
+/** The runner's cap on a serialized completion body. */
+export const LEG_RESULT_MAX_BYTES = 8 * 1024
+
+/** An EVM hash as the runner requires it: 32 bytes, lowercase. */
+function lowerHash(h: string): Hex {
+  return h.toLowerCase() as Hex
+}
+
+/** Keep a completion inside the keys and the size the runner accepts. A venue
+ *  response big enough to breach the cap is dropped rather than truncated —
+ *  the receipt is the hash and the runner re-verifies on-chain anyway. */
+function fitLegResult(result: DeskLegResult): DeskLegResult {
+  const named = Object.fromEntries(
+    Object.entries(result).filter(([k, v]) => v !== undefined && (LEG_RESULT_KEYS as readonly string[]).includes(k)),
+  ) as DeskLegResult
+  const size = (r: DeskLegResult) => {
+    try {
+      return new TextEncoder().encode(JSON.stringify(r)).length
+    } catch {
+      return Infinity
+    }
+  }
+  if (size(named) <= LEG_RESULT_MAX_BYTES) return named
+  const trimmed: DeskLegResult = { ...named, orderResponse: undefined }
+  if (trimmed.batch) trimmed.batch = trimmed.batch.map((m) => ({ ok: m.ok, ...(m.error ? { error: m.error.slice(0, 200) } : {}) }))
+  delete trimmed.orderResponse
+  return size(trimmed) <= LEG_RESULT_MAX_BYTES ? trimmed : { txHash: named.txHash, chainId: named.chainId, detail: named.detail }
+}
+
 /** How many times one leg may be rebuilt after going stale before giving up. */
 const MAX_REBUILDS = 3
 /** How many times one leg may be offered (a batch re-offers from its failed member). */
@@ -717,7 +750,9 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
     if (receipt.status !== 'success') {
       throw new DeskError('broadcast', `Transaction ${hash} reverted on chain ${chainId}.`, { detail: hash })
     }
-    return hash
+    // The runner requires a lowercase 64-hex hash; a wallet may hand back a
+    // checksummed or upper-case one.
+    return lowerHash(hash)
   }
 
   /** Re-quote one step of a chain server-side before signing it. */
@@ -1062,7 +1097,7 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
         throw new DeskError('http', `Leg ${leg.seq} was re-offered ${MAX_LEG_ATTEMPTS} times without completing — stopping.`)
       }
       attempts.set(leg.seq, signed)
-      const result = await signLeg(leg)
+      const result = fitLegResult(await signLeg(leg))
       const done = await doFetch(`${origin}/api/jobs/${jobId}/complete?t=${encodeURIComponent(token)}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...headers },
@@ -1174,26 +1209,22 @@ export interface OpenAndExecuteResult {
 /**
  * The consent text a wallet signs to prove it owns an agent-signed intent.
  *
- * Mirrors `deskExecuteConsentMessage` in the Pantessa app, **byte for byte**.
- * The desk recovers the signer from the text IT builds, so a single character
- * of drift here recovers to a different address and reads to the caller like a
- * wallet bug. The harness pins the two copies line for line.
+ * **Byte-exact** with `deskExecuteConsentMessage` in the Pantessa app: five
+ * lines joined by `\n`, no trailing newline, the em dash on line 1 is U+2014,
+ * and `issuedAt` is the caller's own `new Date().toISOString()` string passed
+ * to `broker_execute` VERBATIM as `issued_at` — the desk rebuilds this text
+ * from that string and recovers the signer from it, so a single character of
+ * drift recovers to a different address and reads like a wallet failure.
+ * There is deliberately no fallback spelling: drift must fail loudly.
  *
- * With `issuedAt` (an ISO timestamp) the text carries a freshness line, which
- * the desk checks both ways inside a ten-minute window; without it, the
- * original four-line text. `openAndExecute` signs the fresh form and falls
- * back to the original once if the desk has not shipped it yet.
- *
- * TODO-verify: the `Issued at:` line's exact format is the squad's decision of
- * record (agent-desk squad, C1) but the server side had not landed when this
- * was written — re-pin against `lib/broker-exec.ts` before publishing.
+ * The desk accepts the signature inside a ten-minute window, both ways.
  */
-export function deskExecuteConsentMessage(intentId: string, wallet: string, issuedAt?: string): string {
+export function deskExecuteConsentMessage(intentId: string, wallet: string, issuedAt: string): string {
   return [
-    'Pantessa agent desk — execute consent',
+    'Pantessa agent desk \u2014 execute consent',
     `Intent: ${intentId}`,
     `Wallet: ${wallet.toLowerCase()}`,
-    ...(issuedAt ? [`Issued at: ${issuedAt}`] : []),
+    `Issued at: ${issuedAt}`,
     "Signing lets the desk compile this intent into a job owned by this wallet. It moves nothing by itself; every leg still needs this wallet's own signature.",
   ].join('\n')
 }
@@ -1327,26 +1358,16 @@ export async function openAndExecute(options: OpenAndExecuteOptions): Promise<Op
   }
 
   // Signed immediately before the call so the freshness window is the
-  // round-trip, not however long the negotiation took.
+  // round-trip, not however long the negotiation took. `agent_key` is required
+  // on execute and compared timing-safe against the one the intent was opened
+  // with — the agent-signed path has no human in the loop.
   const issuedAt = new Date().toISOString()
-  let exec: Record<string, unknown>
-  try {
-    exec = await call('broker_execute', {
-      intent_id: intentId,
-      issued_at: issuedAt,
-      wallet_signature: await me.signMessage(deskExecuteConsentMessage(intentId, me.address, issuedAt)),
-    })
-  } catch (e) {
-    // A desk that has not shipped the freshness line recovers a different
-    // address from our text and refuses the wallet proof. That must not read
-    // as a wallet bug, so sign the original text once and try again.
-    const refusedProof = e instanceof DeskError && e.code === 'desk-refused' && /wallet_signature|consent|recovers/i.test(e.message)
-    if (!refusedProof) throw e
-    exec = await call('broker_execute', {
-      intent_id: intentId,
-      wallet_signature: await me.signMessage(deskExecuteConsentMessage(intentId, me.address)),
-    })
-  }
+  const exec = await call('broker_execute', {
+    intent_id: intentId,
+    issued_at: issuedAt,
+    agent_key: agentKey,
+    wallet_signature: await me.signMessage(deskExecuteConsentMessage(intentId, me.address, issuedAt)),
+  })
 
   const jobId = typeof exec.jobId === 'string' ? exec.jobId : ''
   const drive = obj(exec.drive)
