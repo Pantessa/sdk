@@ -954,7 +954,7 @@ describe('driveJob — CoW order legs', () => {
     expect(submit.body).toMatchObject({ chainId: 8453, order: td.message, from: account.address, appDataJson: '{"version":"1.3.0","appCode":"Pantessa"}', quoteId: 4242, mode: 'limit' })
     // The signature is the signer's, over the artifact's typed data VERBATIM.
     const signature = submit.body!.signature as `0x${string}`
-    expect(await recoverTypedDataAddress({ ...(td as never), signature } as never)).toBe(account.address)
+    expect(await recoverTypedDataAddress({ ...(td as unknown as Record<string, unknown>), signature } as never)).toBe(account.address)
 
     const completion = api.calls.find((c) => c.url.includes('/complete'))!.body!
     const result = completion.result as DeskLegResult

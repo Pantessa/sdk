@@ -110,7 +110,7 @@ describe('SafeTx hashing', () => {
   it('hashes over the Safe domain {chainId, verifyingContract} ONLY — no name, no version — and the ten-field struct', () => {
     const tx = expectedTx()
     const explicit = hashTypedData({
-      domain: { chainId: 84532, verifyingContract: SAFE },
+      domain: { chainId: 84532n, verifyingContract: SAFE },
       types: {
         EIP712Domain: [
           { name: 'chainId', type: 'uint256' },
