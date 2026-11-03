@@ -481,7 +481,69 @@ a signature. Every failure this module raises is a `DeskError` with a `code`
   `DeskNext`, `legViewOf` and `deskNextOf` are line-for-line copies of
   `lib/desk-wire.ts` in the Pantessa app, and the app's harness pins the two in
   sync — so what this SDK calls a leg is exactly what the desk calls one.
+- **A CoW `order` leg is signed and placed, not handed off** (1.2.0). The
+  loop signs the artifact's EIP-712 order verbatim with the signer's
+  `signTypedData` and POSTs it to `/api/cow/submit` with the exact body the
+  app's own order card sends (`{ chainId, order, signature, from, appDataJson,
+  quoteId, mode }`); the relay re-gates (receiver = from, not expired,
+  canonical appData, spend policy) and forwards to the order book. The venue's
+  uid comes back in `orderResponse` (+ `explorerUrl`, `status: 'open'`, and in
+  `detail`). The order's own `validTo` is its clock — an expired one is
+  rebuilt, never signed. A signer with no `signTypedData` refuses **by name**;
+  a Seaport order is refused by name (CoW only).
 
+### Custody signers
+
+An institution signs with its custody, not a browser wallet. `driveJob` takes
+a third signer shape, `DeskCustodySigner`: an adapter that signs FOR an
+account whose key it does not hold. The legs are built for that account
+(`address`), the adapter's `sendTransaction` carries every EVM leg, and
+`supports(kind)` names the leg kinds it will **not** sign — the loop reads it
+before signing, so a custody that cannot presign an off-chain order fails
+closed in its own words instead of burning a signature.
+
+`pantessa/safe` ships the first adapter — a Safe:
+
+```ts
+import { driveJob } from 'pantessa/desk'
+import { safeSigner } from 'pantessa/safe'
+import { privateKeyToAccount } from 'viem/accounts'
+
+const owner = privateKeyToAccount(process.env.OWNER_KEY as `0x${string}`)
+const signer = safeSigner({
+  safeAddress: '0xYourSafe',
+  chainId: 8453,
+  owner,                       // an OWNER of the Safe (LocalAccount or WalletClient)
+  rpc: 'https://your-base-rpc', // nonce/owners/threshold read on-chain; the owner executes
+  // executor: false,          // propose only; wait for the firm's own executor
+  // txServiceUrl, apiKey,     // a self-hosted Safe Transaction Service
+  onEvent: (e) => console.log(e.kind, e),
+})
+await driveJob({ base, jobId, token, signer, rpc: { 8453: 'https://your-base-rpc' } })
+```
+
+What happens per EVM leg: the transaction becomes a `SafeTx` (CALL, no gas
+refund, the Safe's current nonce), hashed exactly as the contract hashes it
+(`SafeTx` EIP-712 over `{ chainId, verifyingContract }` — `safeTxHash` is
+pinned against a deployed Safe's `getTransactionHash`), signed by the owner,
+**proposed to the Safe Transaction Service** (so the firm's other owners see it
+in their Safe — every address EIP-55 checksummed, as the service requires),
+then executed: by the owner itself once the threshold is met (a threshold
+above one waits for the others' confirmations on the service and packs them
+in owner order), or — with `executor: false` — by whoever the firm's queue
+executes with, the loop waiting for the service to report the hash. A reverted
+`execTransaction` is never a completed leg. `SAFE_TX_SERVICE` holds Safe's own
+hosts per chain.
+
+What a Safe refuses **by name** in this version: a CoW `order` leg (Safe
+presign — `setPreSignature` — is wave 2), a Hyperliquid action (unmeasured —
+the venue signs with a key a Safe does not have), and the desk's execute
+consent: a Safe cannot `personal_sign`, so `openAndExecute` with a Safe
+signer says so. Open the intent with an owner account (the EOA the desk can
+prove) and drive the job with the Safe — or ask the desk for an EIP-1271
+door. Measured on Base Sepolia 2026-11-03: a 1-of-1 Safe drove a three-step
+attested swap leg (approve → Permit2 → swap) through the service and the
+chain, the owner as executor.
 
 ---
 
@@ -609,7 +671,7 @@ with an explicit `targetOrigin` (never `'*'`).
 
 ### `pantessa/desk`
 
-- `driveJob(options)` — poll a Pantessa job and sign every leg it offers with your own signer (`tx` / `txChain` incl. re-quotes / `hlAction` / `hlBatch`), completing each one; resolves when the job is `done` / `failed` / `canceled`. `dryRun: true` classifies and stops before the first broadcast.
+- `driveJob(options)` — poll a Pantessa job and sign every leg it offers with your own signer (`tx` / `txChain` incl. re-quotes / `hlAction` / `hlBatch` / CoW `order` via `/api/cow/submit`), completing each one; resolves when the job is `done` / `failed` / `canceled`. `dryRun: true` classifies and stops before the first broadcast. The signer may be a `DeskCustodySigner` (`isCustodySigner`); a leg kind it names in `supports(kind)` is refused in its words before anything is signed.
 - `openAndExecute(options)` — `broker_open` → pick an option (default: the first funding route when the wallet is short, else proceed) → consent `personal_sign` → `broker_execute`; returns `{ intentId, jobId, token, steps }`.
 - `deskCall(base, tool, args)` — call one desk MCP tool over plain JSON-RPC (the desk is stateless Streamable HTTP: no `initialize`, no session header).
 - `legViewOf(step)` / `deskNextOf(job)` — the mirror of the app's `lib/desk-wire.ts`: classify a raw Jobs-API step into a `DeskLegView`, or answer "what should I do right now" for a whole job.
@@ -617,6 +679,13 @@ with an explicit `targetOrigin` (never `'*'`).
 - `deskExecuteConsentMessage(intentId, wallet)` — the exact consent bytes the desk recovers.
 - `firstFundableOption(options, plan)` — the default option picker.
 - `DeskError` / `DEFAULT_RPC`.
+- `DeskCustodySigner` / `isCustodySigner(signer)` — the custody adapter shape `driveJob` takes beside a viem account or client (`address`, `custody`, `supports(kind)`, `sendTransaction`, optional `signTypedData` / `signMessage`).
+
+### `pantessa/safe`
+
+- `safeSigner({ safeAddress, chainId, owner, rpc?, executor?, txServiceUrl?, apiKey?, pollMs?, timeoutMs?, nonce?, origin?, headers?, onEvent? })` — a `DeskCustodySigner` that drives EVM legs through a Safe: SafeTx hash → owner signature → proposal to the Safe Transaction Service → execution (the owner by default; `executor: false` waits for the firm's own) → receipt. Refuses `order` / `hlAction` / `hlBatch` by name; has no `signMessage`.
+- `safeTxHash(chainId, safe, tx)` / `safeTxTypedData(chainId, safe, tx)` / `safeTxOf(leg, nonce)` / `packSignatures(confirmations)` / `safeProposalBody(...)` — the pure rules, exported for pins.
+- `SAFE_TX_SERVICE` — Safe's own Transaction Service host per chain (Ethereum, Optimism, Base, Arbitrum, Base Sepolia). `SAFE_TX_TYPES` / `SAFE_ABI` — the hand-written Safe types and the minimal ABI (no protocol-kit).
 
 ### Helpers
 

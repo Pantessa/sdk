@@ -229,30 +229,67 @@ function chainFor(chainId: number, rpcUrl: string): Chain {
 
 /* ── the signer ───────────────────────────────────────────────────────── */
 
-/**
- * Anything that can sign for one address: a viem `LocalAccount`
- * (`privateKeyToAccount(...)`) or a viem `WalletClient` with an account.
- */
-export type DeskSigner = Account | WalletClient
-
-interface TypedDataLike {
+/** An EIP-712 payload as a leg carries it — verbatim from the runner. */
+export interface TypedDataLike {
   domain: Record<string, unknown>
   types: Record<string, unknown>
   primaryType: string
   message: Record<string, unknown>
 }
 
-interface NormalSigner {
-  address: Address
-  signMessage(message: string): Promise<Hex>
-  signTypedData(typedData: TypedDataLike): Promise<Hex>
-  sendTransaction(tx: LegTx, chainId: number): Promise<Hex>
-}
-
-interface LegTx {
+/** One EVM transaction as a leg carries it (`txRequest`, or a chain step's `tx`). */
+export interface LegTx {
   to: Address
   data?: Hex
   value?: string | bigint
+}
+
+/**
+ * A custody adapter: signs FOR an account whose key it does not hold — a
+ * Safe whose owners sign and whose Transaction Service queues the proposal,
+ * a vault behind an approval queue. `address` is the account the legs are
+ * built for (the Safe, not its owner). `supports(kind)` answers `null` for a
+ * leg kind it will sign and the REFUSAL SENTENCE for one it will not — the
+ * loop reads it before signing, so a custody that cannot presign an
+ * off-chain order fails closed by name instead of burning a signature.
+ * `signMessage` / `signTypedData` are optional: a Safe has no key to
+ * `personal_sign` with, and says so when asked.
+ *
+ * `pantessa/safe`'s {@link safeSigner} is the first adapter.
+ */
+export interface DeskCustodySigner {
+  address: Address
+  /** The custody's name — `safe` — so an error can say which one refused. */
+  custody: string
+  supports(kind: DeskLegKind): string | null
+  sendTransaction(tx: LegTx, chainId: number): Promise<Hex>
+  signTypedData?(typedData: TypedDataLike): Promise<Hex>
+  signMessage?(message: string): Promise<Hex>
+}
+
+/**
+ * Anything that can sign for one address: a viem `LocalAccount`
+ * (`privateKeyToAccount(...)`), a viem `WalletClient` with an account, or a
+ * custody adapter ({@link DeskCustodySigner}).
+ */
+export type DeskSigner = Account | WalletClient | DeskCustodySigner
+
+/** Tell a custody adapter from a viem account or client. */
+export function isCustodySigner(signer: DeskSigner): signer is DeskCustodySigner {
+  const c = signer as DeskCustodySigner
+  return typeof c.custody === 'string' && typeof c.supports === 'function' && typeof c.sendTransaction === 'function'
+}
+
+interface NormalSigner {
+  address: Address
+  /** Whether this signer can produce an EIP-712 signature at all — a CoW
+   *  order leg refuses by name before it asks when it cannot. */
+  canSignTypedData: boolean
+  signMessage(message: string): Promise<Hex>
+  signTypedData(typedData: TypedDataLike): Promise<Hex>
+  sendTransaction(tx: LegTx, chainId: number): Promise<Hex>
+  /** A custody adapter's own refusal for a leg kind it will not sign. */
+  supports?(kind: DeskLegKind): string | null
 }
 
 function signerAddress(signer: DeskSigner): Address {
@@ -266,6 +303,33 @@ function signerAddress(signer: DeskSigner): Address {
 /** Normalize a LocalAccount or a WalletClient behind one small surface. */
 function normalizeSigner(signer: DeskSigner, rpc: Record<number, string>): NormalSigner {
   const address = signerAddress(signer)
+  if (isCustodySigner(signer)) {
+    const custody = signer
+    const name = custody.custody
+    return {
+      address,
+      canSignTypedData: typeof custody.signTypedData === 'function',
+      supports: (kind) => custody.supports(kind),
+      async signMessage(message) {
+        if (typeof custody.signMessage !== 'function') {
+          throw new DeskError(
+            'signer',
+            `A ${name} custody signer cannot personal_sign — there is no key for ${address}. ` +
+              "The desk's execute consent (openAndExecute) needs the account's own key: open the intent with an owner account, " +
+              'or ask the desk for an EIP-1271 door, then drive the job with the custody signer.',
+          )
+        }
+        return custody.signMessage(message)
+      },
+      async signTypedData(typedData) {
+        if (typeof custody.signTypedData !== 'function') {
+          throw new DeskError('signer', `A ${name} custody signer signs EVM transactions only in this version — it has no signTypedData.`)
+        }
+        return custody.signTypedData(typedData)
+      },
+      sendTransaction: (tx, chainId) => custody.sendTransaction(tx, chainId),
+    }
+  }
   const local = (signer as Account).type === 'local' ? (signer as Account) : null
   const client = local ? null : (signer as WalletClient)
   const walletClients = new Map<number, WalletClient>()
@@ -283,6 +347,7 @@ function normalizeSigner(signer: DeskSigner, rpc: Record<number, string>): Norma
 
   return {
     address,
+    canSignTypedData: local ? typeof local.signTypedData === 'function' : typeof client!.signTypedData === 'function',
     async signMessage(message) {
       if (local) return (local.signMessage as (a: { message: string }) => Promise<Hex>)({ message })
       return client!.signMessage({ account: client!.account ?? address, message } as never)
@@ -472,6 +537,13 @@ function staleOf(kind: DeskLegKind, artifact: Record<string, unknown> | null, st
       // A cross-chain deposit address is the venue's and it expires.
       const expires = msOf(artifact.addressExpires)
       if (expires != null) return clamp(expires)
+    }
+    if (kind === 'order') {
+      // A CoW order carries its own clock: `validTo` (unix SECONDS) in the
+      // signed message. The book refuses an expired order, so sign nothing
+      // past it — ask the runner for a fresh build instead.
+      const validTo = num(obj(obj(obj(artifact.orderRequest)?.typedData)?.message)?.validTo)
+      if (validTo != null) return clamp(validTo * 1000)
     }
   }
   const touched = msOf(step.updatedAt)
@@ -703,11 +775,17 @@ const MAX_LEG_ATTEMPTS = 4
  *
  * Polls the job, and whenever the runner offers a leg signs the shape it
  * carries — a single transaction, a transaction chain (re-quoting any step
- * that carries a `refresh` recipe), a Hyperliquid L1 action, or a batch of
- * them — broadcasts it, waits for the receipt, and posts completion. Wait
- * legs are left to the runner, which verifies arrival on-chain before the
- * next leg is built. Returns when the job reaches `done`, `failed` or
- * `canceled`.
+ * that carries a `refresh` recipe), a Hyperliquid L1 action, a batch of
+ * them, or a CoW order (EIP-712, submitted through `POST /api/cow/submit`
+ * with the body the app's own order card sends) — broadcasts it, waits for
+ * the receipt, and posts completion. Wait legs are left to the runner, which
+ * verifies arrival on-chain before the next leg is built. Returns when the
+ * job reaches `done`, `failed` or `canceled`.
+ *
+ * The signer may be a custody adapter ({@link DeskCustodySigner}, e.g.
+ * `pantessa/safe`'s `safeSigner`): the legs are then built for the custody
+ * account, and a leg kind the custody will not sign is refused by name
+ * before anything is signed.
  *
  * With `dryRun: true` nothing is signed and nothing is broadcast: the loop
  * returns as soon as the first leg is offered, with the leg views it saw.
@@ -1053,14 +1131,74 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
     }
 
     if (leg.kind === 'order') {
-      const protocol = str(obj(a.orderRequest)?.protocol) ?? 'unknown'
-      throw new DeskError(
-        'unsupported-leg',
-        `Leg ${leg.seq} is a ${protocol} order. pantessa/desk signs Hyperliquid actions and EVM transactions; ` +
-          'an off-chain order has its own submit endpoint and prerequisites, so this loop will not guess at it — ' +
-          'hand this leg to a human sign link (broker_handoff) or sign it yourself.',
-        { detail: leg.summary },
-      )
+      const order = obj(a.orderRequest)!
+      const protocol = (str(order.protocol) ?? 'unknown').toLowerCase()
+      // CoW only. A Seaport (OpenSea) order shares the artifact shape but has
+      // its own submit route and a conduit approval the card drives — this
+      // loop will not guess at it.
+      if (protocol !== 'cow') {
+        throw new DeskError(
+          'unsupported-leg',
+          `Leg ${leg.seq} is a ${protocol} order. pantessa/desk signs CoW orders, Hyperliquid actions and EVM transactions; ` +
+            `a ${protocol} order has its own submit endpoint and prerequisites, so this loop will not guess at it — ` +
+            'hand this leg to a human sign link (broker_handoff) or sign it yourself.',
+          { detail: leg.summary },
+        )
+      }
+      const td = obj(order.typedData)
+      const message = obj(td?.message)
+      if (!td || !message) throw new DeskError('unsupported-leg', `Leg ${leg.seq} is a CoW order but carries no typed data to sign.`)
+      if (!me.canSignTypedData) {
+        throw new DeskError(
+          'signer',
+          `Leg ${leg.seq} is a CoW order: it needs an EIP-712 signature (signTypedData) and this signer has none — ` +
+            'pass a viem LocalAccount or a WalletClient with an account, or hand this leg to a human sign link (broker_handoff).',
+          { detail: leg.summary },
+        )
+      }
+      const chainId = num(order.chainId) ?? leg.chainId ?? num(obj(td.domain)?.chainId)
+      if (!chainId) throw new DeskError('unsupported-leg', `Leg ${leg.seq} is a CoW order that names no chain.`)
+      // A one-time on-chain prerequisite the build carries signs FIRST, as
+      // the order card does — never "sign this, then ask again".
+      const prereq = obj(order.prereqTx)
+      if (prereq && typeof prereq.to === 'string') {
+        await send(prereq as unknown as LegTx, num(prereq.chainId) ?? chainId)
+      }
+      // Sign the typed data VERBATIM — the guard approved exactly this order.
+      const signature = await me.signTypedData(td as unknown as TypedDataLike)
+      // The body the app's own SignOrderButton sends, field for field; the
+      // relay re-gates (receiver = from, not expired, canonical appData,
+      // spend policy) and forwards to the order book.
+      const res = await doFetch(`${origin}/api/cow/submit`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({
+          chainId,
+          order: message,
+          signature,
+          from: me.address,
+          appDataJson: typeof order.appDataJson === 'string' ? order.appDataJson : undefined,
+          quoteId: typeof order.quoteId === 'number' ? order.quoteId : undefined,
+          mode: message.feeAmount === '0' ? 'limit' : 'swap',
+        }),
+      }).catch((e: unknown) => {
+        throw new DeskError('http', `POST /api/cow/submit failed: ${asError(e).message}`, { cause: e })
+      })
+      const body = await readJson(res)
+      if (!res.ok) {
+        throw new DeskError('http', `CoW submit refused: ${errorLine(body, 'the relay refused the order')}`, { status: res.status })
+      }
+      const orderUid = typeof body.orderUid === 'string' ? body.orderUid : null
+      const explorerUrl = typeof body.explorerUrl === 'string' ? body.explorerUrl : undefined
+      // The venue's uid rides in `orderResponse` (the wire's slot for an
+      // off-chain order's response) and in `detail`; `explorerUrl` is the
+      // book's own page for it — there is no EVM explorer for a CoW order.
+      return {
+        orderResponse: body,
+        status: 'open',
+        ...(explorerUrl ? { explorerUrl } : {}),
+        detail: orderUid ? `CoW order ${orderUid} placed on chain ${chainId} — ${leg.summary}` : leg.summary,
+      }
     }
 
     throw new DeskError(
@@ -1101,6 +1239,13 @@ export async function driveJob(options: DriveJobOptions): Promise<DriveJobOutcom
       if (dryRun) return { jobId, status: 'dry', legs, results }
       if (results.length >= maxLegs) {
         throw new DeskError('max-legs', `Stopped after ${maxLegs} signed legs (job ${jobId} is still running).`)
+      }
+      // A custody adapter names the leg kinds it will not sign (a Safe has
+      // no key for an off-chain order) — refuse BEFORE a rebuild or a
+      // signature, in its own words.
+      const refusal = me.supports?.(leg.kind)
+      if (refusal) {
+        throw new DeskError('signer', `Leg ${leg.seq} (${leg.kind}): ${refusal}`, { detail: leg.summary })
       }
       // A build whose clock has run out is REBUILT, never re-signed: the
       // Hyperliquid nonce window is 90s while the offer stands for 30 min.
