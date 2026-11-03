@@ -10,6 +10,7 @@ export default defineConfig({
     express: 'src/express.ts',
     embed: 'src/embed.ts',
     desk: 'src/desk.ts',
+    safe: 'src/safe.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

@@ -1,6 +1,6 @@
 {
   "name": "pantessa",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Spend-controlled x402 for AI agents. Give an agent an expense account — an allowlist + per-call/per-day budget — and pay any x402 endpoint in a few lines. Plus drop-in x402 client/server helpers and the embeddable Pantessa chat.",
   "keywords": [
     "x402",
@@ -71,6 +71,11 @@
       "types": "./dist/desk.d.ts",
       "import": "./dist/desk.js",
       "require": "./dist/desk.cjs"
+    },
+    "./safe": {
+      "types": "./dist/safe.d.ts",
+      "import": "./dist/safe.js",
+      "require": "./dist/safe.cjs"
     }
   },
   "files": [

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { recoverTypedDataAddress } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import {
   DeskError,
@@ -22,6 +23,7 @@ const account = privateKeyToAccount(KEY)
 const ADDR = '0x2222222222222222222222222222222222222222'
 const HASH_A = '0xaaaa000000000000000000000000000000000000000000000000000000000001'
 const HASH_B = '0xbbbb000000000000000000000000000000000000000000000000000000000002'
+const COW_UID = `0x${'cd'.repeat(56)}`
 
 /* ── a tiny fake Pantessa ─────────────────────────────────────────────── */
 
@@ -30,6 +32,7 @@ interface FakeOpts {
   jobs: Array<Record<string, unknown>>
   hl?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> }
   refresh?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> }
+  cow?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> }
   completeStatus?: number
   completeBody?: Record<string, unknown>
   retryStatus?: number
@@ -51,6 +54,10 @@ function fakePantessa(opts: FakeOpts) {
     }
     if (url.includes('/api/hl/submit')) {
       const r = opts.hl?.(body!) ?? { status: 200, body: { status: 'filled', filled: { totalSz: '1', avgPx: '10' } } }
+      return json(r.status, r.body)
+    }
+    if (url.includes('/api/cow/submit')) {
+      const r = opts.cow?.(body!) ?? { status: 200, body: { orderUid: COW_UID, explorerUrl: `https://explorer.cow.fi/base/orders/${COW_UID}` } }
       return json(r.status, r.body)
     }
     if (url.includes('/complete')) {
@@ -858,5 +865,225 @@ describe('firstFundableOption', () => {
   it('never picks the decline option', () => {
     const withDecline = [...opts, { id: 'decline', label: 'w', resume: 'r', kind: 'decline' as const }]
     expect(firstFundableOption(withDecline, {})!.kind).not.toBe('decline')
+  })
+})
+
+/* ── CoW order legs + custody signers (1.2.0) ─────────────────────────── */
+
+describe('driveJob — CoW order legs', () => {
+  const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+  const WETH = '0x4200000000000000000000000000000000000006'
+  const COW_TYPES = {
+    Order: [
+      { name: 'sellToken', type: 'address' },
+      { name: 'buyToken', type: 'address' },
+      { name: 'receiver', type: 'address' },
+      { name: 'sellAmount', type: 'uint256' },
+      { name: 'buyAmount', type: 'uint256' },
+      { name: 'validTo', type: 'uint32' },
+      { name: 'appData', type: 'bytes32' },
+      { name: 'feeAmount', type: 'uint256' },
+      { name: 'kind', type: 'string' },
+      { name: 'partiallyFillable', type: 'bool' },
+      { name: 'sellTokenBalance', type: 'string' },
+      { name: 'buyTokenBalance', type: 'string' },
+    ],
+  }
+  /** The artifact exactly as lib/cow.ts `cowOrderAction` mints it and the runner stores it. */
+  const cowStep = (seq = 0, opts: { validTo?: number; feeAmount?: string; extra?: Record<string, unknown>; receiver?: string } = {}): JobStep => ({
+    seq,
+    kind: 'sign',
+    status: 'offered',
+    title: 'Swap 25 USDC for ETH on CoW',
+    builder: 'native-swap-cow',
+    valueUsd: 25,
+    artifact: {
+      orderRequest: {
+        protocol: 'cow',
+        summary: 'Swap 25 USDC for ETH on CoW',
+        chainId: 8453,
+        typedData: {
+          domain: { name: 'Gnosis Protocol', version: 'v2', chainId: 8453, verifyingContract: '0x9008D19f58AAbD9eD0D60971565AA8510560ab41' },
+          primaryType: 'Order',
+          types: COW_TYPES,
+          message: {
+            sellToken: USDC,
+            buyToken: WETH,
+            receiver: opts.receiver ?? account.address,
+            sellAmount: '25000000',
+            buyAmount: '9000000000000000',
+            validTo: opts.validTo ?? Math.floor(Date.now() / 1000) + 1800,
+            appData: `0x${'ab'.repeat(32)}`,
+            feeAmount: opts.feeAmount ?? '0',
+            kind: 'sell',
+            partiallyFillable: false,
+            sellTokenBalance: 'erc20',
+            buyTokenBalance: 'erc20',
+          },
+        },
+        submitUrl: 'https://api.cow.fi/base/api/v1/orders',
+        appDataJson: '{"version":"1.3.0","appCode":"Pantessa"}',
+        quoteId: 4242,
+        ...(opts.extra ?? {}),
+      },
+      summary: 'Swap 25 USDC for ETH on CoW',
+    },
+  })
+
+  it('classifies a CoW order with its validTo as the clock', () => {
+    const v = legViewOf(cowStep())
+    expect(v.kind).toBe('order')
+    expect(v.chainId).toBe(8453)
+    expect(v.staleAfterMs).toBeGreaterThan(1_700_000)
+    expect(v.staleAfterMs).toBeLessThanOrEqual(1_800_000)
+    expect(v.summary).toContain('cow order')
+    expect(legViewOf(cowStep(0, { validTo: Math.floor(Date.now() / 1000) - 5 })).staleAfterMs).toBe(0)
+  })
+
+  it('signs the order with EIP-712, submits the card\'s exact body, and reports the uid where the wire has a slot', async () => {
+    const api = fakePantessa({ jobs: [job('waiting_signature', [cowStep()]), job('done', [{ ...cowStep(), status: 'done' }])] })
+    const out = await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer: account, fetch: api.doFetch, headers: { 'x-yf-internal-run': '1' } })
+    expect(out.status).toBe('done')
+
+    const submit = api.calls.find((c) => c.url === 'http://x/api/cow/submit')!
+    expect(submit).toBeDefined()
+    expect(submit.headers['x-yf-internal-run']).toBe('1')
+    // Field for field what components/SignOrderButton.tsx sends — same keys, same order.
+    expect(Object.keys(submit.body!)).toEqual(['chainId', 'order', 'signature', 'from', 'appDataJson', 'quoteId', 'mode'])
+    const td = (cowStep().artifact as { orderRequest: { typedData: Record<string, unknown> } }).orderRequest.typedData
+    expect(submit.body).toMatchObject({ chainId: 8453, order: td.message, from: account.address, appDataJson: '{"version":"1.3.0","appCode":"Pantessa"}', quoteId: 4242, mode: 'limit' })
+    // The signature is the signer's, over the artifact's typed data VERBATIM.
+    const signature = submit.body!.signature as `0x${string}`
+    expect(await recoverTypedDataAddress({ ...(td as never), signature } as never)).toBe(account.address)
+
+    const completion = api.calls.find((c) => c.url.includes('/complete'))!.body!
+    const result = completion.result as DeskLegResult
+    expect(result.orderResponse).toMatchObject({ orderUid: COW_UID })
+    expect(result.explorerUrl).toBe(`https://explorer.cow.fi/base/orders/${COW_UID}`)
+    expect(result.status).toBe('open')
+    expect(result.detail).toContain(COW_UID)
+    expect(result.detail).toContain('chain 8453')
+    for (const k of Object.keys(result)) expect(DESK_LEG_RESULT_KEYS as readonly string[]).toContain(k)
+    expect(out.results[0]!.result.detail).toContain(COW_UID)
+  })
+
+  it('calls a fee-bearing order a swap, as the card does', async () => {
+    const api = fakePantessa({ jobs: [job('waiting_signature', [cowStep(0, { feeAmount: '1200' })]), job('done', [{ ...cowStep(), status: 'done' }])] })
+    await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer: account, fetch: api.doFetch })
+    expect(api.calls.find((c) => c.url.includes('/api/cow/submit'))!.body!.mode).toBe('swap')
+  })
+
+  it('refuses BY NAME when the signer cannot sign typed data — no signature, no submit', async () => {
+    const api = fakePantessa({ jobs: [job('waiting_signature', [cowStep()])] })
+    const jsonRpcAccount = { address: ADDR, type: 'json-rpc' } as unknown as DeskSigner
+    const err = await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer: jsonRpcAccount, fetch: api.doFetch }).catch((e) => e)
+    expect(err).toMatchObject({ code: 'signer' })
+    expect((err as DeskError).message).toContain('Leg 0')
+    expect((err as DeskError).message).toContain('signTypedData')
+    expect(api.calls.some((c) => c.url.includes('/api/cow/submit') || c.url.includes('/complete'))).toBe(false)
+  })
+
+  it('asks the runner to REBUILD an order past its validTo — never signs or submits it', async () => {
+    const stale = cowStep(0, { validTo: Math.floor(Date.now() / 1000) - 10 })
+    const fresh = cowStep(0)
+    const api = fakePantessa({ jobs: [job('waiting_signature', [stale]), job('waiting_signature', [fresh]), job('done', [{ ...fresh, status: 'done' }])] })
+    const { signer, typed } = fakeSigner()
+    const out = await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer, pollMs: 1, fetch: api.doFetch })
+    expect(api.calls.some((c) => c.url.includes('/retry'))).toBe(true)
+    expect(typed).toHaveLength(1)
+    expect((typed[0]!.message as Record<string, unknown>).validTo).toBe((fresh.artifact as { orderRequest: { typedData: { message: { validTo: number } } } }).orderRequest.typedData.message.validTo)
+    expect(api.calls.filter((c) => c.url.includes('/api/cow/submit'))).toHaveLength(1)
+    expect(out.status).toBe('done')
+  })
+
+  it('surfaces the relay\'s own refusal (re-gate) and posts no completion', async () => {
+    const api = fakePantessa({
+      jobs: [job('waiting_signature', [cowStep()])],
+      cow: () => ({ status: 403, body: { error: 'Refused: order pays 0x…, not the signing wallet.' } }),
+    })
+    const err = await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer: account, fetch: api.doFetch }).catch((e) => e)
+    expect(err).toMatchObject({ code: 'http', status: 403 })
+    expect((err as DeskError).message).toContain('not the signing wallet')
+    expect(api.calls.some((c) => c.url.includes('/complete'))).toBe(false)
+  })
+
+  it('sends a one-time prerequisite transaction FIRST when the build carries one', async () => {
+    vi.resetModules()
+    const { sent } = withStubbedChain([HASH_A])
+    const mod = await import('./desk.js')
+    const step = cowStep(0, { extra: { prereqTx: { to: USDC, data: '0x095ea7b3', value: '0', chainId: 8453 }, prereqTitle: 'Approve USDC' } })
+    const api = fakePantessa({ jobs: [job('waiting_signature', [step]), job('done', [{ ...step, status: 'done' }])] })
+    const out = await mod.driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer: account, fetch: api.doFetch })
+    expect(out.status).toBe('done')
+    expect(sent).toEqual([{ to: USDC, chainId: 8453 }])
+    expect(api.calls.some((c) => c.url.includes('/api/cow/submit'))).toBe(true)
+    vi.doUnmock('viem')
+  })
+
+  it('still fails closed on a Seaport order, naming CoW as the only order it signs', async () => {
+    const api = fakePantessa({
+      jobs: [job('waiting_signature', [{ seq: 0, kind: 'sign', status: 'offered', title: 'List the NFT', artifact: { orderRequest: { protocol: 'opensea', typedData: { message: {} }, chainId: 1 } } }])],
+    })
+    const err = await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer: account, fetch: api.doFetch }).catch((e) => e)
+    expect(err).toMatchObject({ code: 'unsupported-leg' })
+    expect((err as DeskError).message).toContain('opensea')
+    expect((err as DeskError).message).toContain('CoW')
+    expect(api.calls.some((c) => c.url.includes('/api/cow/submit') || c.url.includes('/complete'))).toBe(false)
+  })
+})
+
+describe('driveJob — custody signers', () => {
+  const custody = (supports: (k: string) => string | null, hash = HASH_A) => {
+    const sent: Array<{ to: string; chainId: number }> = []
+    const signer = {
+      custody: 'test-vault',
+      address: ADDR as `0x${string}`,
+      supports,
+      async sendTransaction(tx: { to: string }, chainId: number) {
+        sent.push({ to: tx.to, chainId })
+        return hash as `0x${string}`
+      },
+    }
+    return { signer: signer as unknown as DeskSigner, sent }
+  }
+
+  it('is told apart from a viem account or client', async () => {
+    const { isCustodySigner } = await import('./desk.js')
+    expect(isCustodySigner(custody(() => null).signer)).toBe(true)
+    expect(isCustodySigner(account)).toBe(false)
+    expect(isCustodySigner({ address: ADDR, type: 'json-rpc' } as unknown as DeskSigner)).toBe(false)
+  })
+
+  it('drives a tx leg through the custody and completes with the hash it returned', async () => {
+    vi.resetModules()
+    withStubbedChain()
+    const mod = await import('./desk.js')
+    const api = fakePantessa({ jobs: [job('waiting_signature', [txStep()]), job('done', [{ ...txStep(), status: 'done' }])] })
+    const { signer, sent } = custody(() => null, HASH_B)
+    const out = await mod.driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer, fetch: api.doFetch })
+    expect(out.status).toBe('done')
+    expect(sent).toEqual([{ to: ADDR, chainId: 8453 }])
+    expect(api.calls.find((c) => c.url.includes('/complete'))!.body).toMatchObject({ seq: 0, result: { txHash: HASH_B, chainId: 8453 } })
+    vi.doUnmock('viem')
+  })
+
+  it('refuses a leg kind the custody names, in the custody\'s words, before any signature', async () => {
+    const api = fakePantessa({ jobs: [job('waiting_signature', [hlStep()])] })
+    const { signer, sent } = custody((k) => (k === 'hlAction' ? 'this vault does not sign Hyperliquid actions' : null))
+    const err = await driveJob({ base: 'http://x', jobId: 'job_1', token: 't', signer, fetch: api.doFetch }).catch((e) => e)
+    expect(err).toMatchObject({ code: 'signer' })
+    expect((err as DeskError).message).toBe('Leg 0 (hlAction): this vault does not sign Hyperliquid actions')
+    expect(sent).toHaveLength(0)
+    expect(api.calls.some((c) => c.url.includes('/api/hl/submit') || c.url.includes('/complete') || c.url.includes('/retry'))).toBe(false)
+  })
+
+  it('a custody without signMessage refuses the execute consent by name', async () => {
+    const srv = deskServer({ broker_open: { intentId: 'int_1', plan: { options: [] } } })
+    const { signer } = custody(() => null)
+    const err = await openAndExecute({ base: 'http://x', ask: 'Buy $1 of ETH', signer, agentKey: 'k', fetch: srv.doFetch }).catch((e) => e)
+    expect(err).toMatchObject({ code: 'signer' })
+    expect((err as DeskError).message).toContain('personal_sign')
+    expect((err as DeskError).message).toContain(ADDR)
+    expect(srv.calls.map((c) => c.name)).toEqual(['broker_open'])
   })
 })

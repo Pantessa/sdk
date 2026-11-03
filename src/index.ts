@@ -57,8 +57,9 @@ export type {
   ExactEvmPayload,
 } from './types.js'
 
-export { driveJob, openAndExecute, deskCall, deskExecuteConsentMessage, firstFundableOption, legViewOfStep, DeskError, DEFAULT_RPC } from './desk.js'
+export { driveJob, openAndExecute, deskCall, deskExecuteConsentMessage, firstFundableOption, legViewOfStep, isCustodySigner, DeskError, DEFAULT_RPC } from './desk.js'
 export type {
+  DeskCustodySigner,
   DeskErrorCode,
   DeskLegKind,
   DeskLegResult,
@@ -69,6 +70,11 @@ export type {
   DriveJobOutcome,
   JobStep,
   JobView,
+  LegTx,
   OpenAndExecuteOptions,
   OpenAndExecuteResult,
+  TypedDataLike,
 } from './desk.js'
+
+export { safeSigner, safeTxHash, safeTxTypedData, safeTxOf, packSignatures, safeProposalBody, SAFE_TX_SERVICE, SAFE_TX_TYPES, SAFE_ABI } from './safe.js'
+export type { SafeEvent, SafeSigner, SafeSignerOptions, SafeTxFields } from './safe.js'

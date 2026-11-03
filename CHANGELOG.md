@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.2.0
+
+- **`driveJob` signs and places CoW `order` legs.** An `order` leg whose
+  protocol is `cow` is signed with the signer's `signTypedData` over the
+  artifact's EIP-712 order VERBATIM and POSTed to `/api/cow/submit` with the
+  body the app's own order card sends, field for field (`{ chainId, order,
+  signature, from, appDataJson, quoteId, mode }`); the relay re-gates and
+  forwards to the order book, and the venue's uid is reported in
+  `orderResponse` (+ `explorerUrl`, `status: 'open'`, `detail`). The order's
+  own `validTo` is the leg's clock — an expired order is rebuilt, never
+  signed. A build carrying a one-time `prereqTx` sends it first, as the card
+  does. A signer with no `signTypedData` refuses **by name**; a Seaport
+  (OpenSea) order is still refused by name — CoW only in this version.
+- **Custody signers.** `driveJob` takes a third signer shape beside a viem
+  account or client: `DeskCustodySigner` — an adapter that signs FOR an
+  account whose key it does not hold (`address`, `custody`, `supports(kind)`,
+  `sendTransaction`, optional `signTypedData` / `signMessage`). A leg kind the
+  adapter names in `supports(kind)` is refused in the adapter's own words
+  BEFORE a rebuild or a signature. `isCustodySigner` tells one apart.
+- **New entry point `pantessa/safe` — `safeSigner`, the first custody
+  adapter: drive EVM legs through a Safe.** Every `tx` / `txChain` step
+  becomes a `SafeTx` (CALL, no gas refund, the Safe's current nonce) hashed
+  exactly as the contract hashes it (`SafeTx` EIP-712 over
+  `{ chainId, verifyingContract }`; `safeTxHash` is pinned against a deployed
+  Safe's `getTransactionHash`), signed by an OWNER, proposed to the Safe
+  Transaction Service (every address EIP-55 checksummed — the service refuses
+  a lowercase one by name), then executed: by the owner once the threshold is
+  met (a threshold above one waits for the other owners' confirmations on the
+  service and packs them in owner order), or with `executor: false` by the
+  firm's own executor, the loop waiting for the service to report the hash.
+  Nonce, owners and threshold are read ON-CHAIN when `rpc` is given (no
+  indexer lag), from the service otherwise. A reverted `execTransaction` is
+  never a completed leg. Refuses **by name**: a CoW `order` leg (Safe presign
+  is wave 2), Hyperliquid actions (unmeasured), and the desk's execute consent
+  (a Safe cannot `personal_sign` — open the intent with an owner account and
+  drive the job with the Safe, or ask the desk for an EIP-1271 door).
+  `SAFE_TX_SERVICE` holds Safe's own hosts (Ethereum, Optimism, Base,
+  Arbitrum, Base Sepolia); `SAFE_TX_TYPES` / `SAFE_ABI` are hand-written —
+  `fetch` + viem only, no protocol-kit. Measured on Base Sepolia 2026-11-03:
+  a 1-of-1 Safe drove a three-step attested swap (approve → Permit2 → swap)
+  through the service and the chain.
+- Exported for consumers and pins: `TypedDataLike`, `LegTx`,
+  `DeskCustodySigner`, `isCustodySigner`, and the pure Safe rules
+  (`safeTxTypedData`, `safeTxOf`, `packSignatures`, `safeProposalBody`).
+
 ## 1.1.0
 
 - **New entry point `pantessa/desk` — hand it a signer and it gets done.**
