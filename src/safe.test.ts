@@ -147,7 +147,7 @@ describe('SafeTx hashing', () => {
   it('an owner\'s signature over the typed data recovers to the owner', async () => {
     const td = safeTxTypedData(84532, SAFE, expectedTx())
     const signature = await owner.signTypedData(td as never)
-    expect(await recoverTypedDataAddress({ ...(td as never), signature } as never)).toBe(owner.address)
+    expect(await recoverTypedDataAddress({ ...(td as unknown as Record<string, unknown>), signature } as never)).toBe(owner.address)
   })
 
   it('turns a leg into a CALL with no gas refund, at the given nonce', () => {
@@ -251,7 +251,7 @@ describe('safeSigner', () => {
     const proposal = svc.calls[0]!.body!
     expect(proposal).toMatchObject({ safe: SAFE, to: TO, value: '0', data: '0xdead', operation: 0, nonce: 7, contractTransactionHash: want, sender: owner.address, origin: 'drill' })
     // The signature the service holds is the owner's, over the same hash.
-    expect(await recoverTypedDataAddress({ ...(safeTxTypedData(84532, SAFE, tx) as never), signature: proposal.signature as Hex } as never)).toBe(owner.address)
+    expect(await recoverTypedDataAddress({ ...(safeTxTypedData(84532, SAFE, tx) as unknown as Record<string, unknown>), signature: proposal.signature as Hex } as never)).toBe(owner.address)
     // Executed from the owner: execTransaction(to the Safe) carrying that one signature.
     expect(sent).toHaveLength(1)
     expect(sent[0]!.to).toBe(SAFE)
